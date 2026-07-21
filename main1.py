@@ -2347,7 +2347,8 @@ class MainWindow(QMainWindow):
         else:
             cam_text = "No camera connected."
         text = (f"{APP_NAME} {APP_VERSION}\n\n{cam_text}\n\n"
-                "Made by VOILA Lab, UC Berkeley")
+                "Developed by Jason Liang | VOILA Lab, UC Berkeley\n\nCredits:\nPrimary Mentor: "
+                "Yuanlong Zhao\nSpecial Thanks: Vasilisa, Xue, and Dr. Meng for technical guidance and support!")
         QMessageBox.about(self, f"About {APP_NAME}", text)
 
 
