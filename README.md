@@ -2,7 +2,7 @@
 
 **VOILALab Beam** is a PyQt6 desktop application for live camera-based laser beam profiling. It displays the beam image and X/Y intensity profiles, calculates beam size and position metrics, monitors pointing stability, records measurements, and supports multi-position beam-propagation analysis.
 
-> Current application version reported by the code: **v4.6**
+> Current application version reported by the code: **v4.8**
 
 ## Key features
 
