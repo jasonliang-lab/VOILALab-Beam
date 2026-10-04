@@ -5,3 +5,4 @@ dist/
 beam_profiler_run.log
 .venv/
 venv/
+.DS_Store
