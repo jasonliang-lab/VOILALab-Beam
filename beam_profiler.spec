@@ -21,14 +21,14 @@ datas = [
                              # static analysis can't see this, so it must be
                              # listed explicitly or the frozen exe crashes on
                              # the very first line of MainWindow.__init__.
-    ('beamappicon.ico', '.'),   # only needed if you load this at runtime (e.g. for
+    ('app_icon.ico', '.'),   # only needed if you load this at runtime (e.g. for
                              # setWindowIcon); the .exe's own icon is separate,
                              # set below via `icon=`, not from this list.
 ]
 datas += collect_data_files('matplotlib')  # mpl-data: fonts, style files, etc.
 
 a = Analysis(
-    ['main1.py'],          # <-- change to your actual main script filename
+    ['main.py'],
     pathex=[],
     binaries=[],
     datas=datas,
@@ -61,7 +61,7 @@ exe = EXE(
     strip=False,
     upx=True,
     console=False,           # equivalent to --windowed: no console window
-    icon='beamappicon.ico',     # stamps the icon onto the .exe file itself
+    icon='app_icon.ico',     # stamps the icon onto the .exe file itself
 )
 coll = COLLECT(
     exe,

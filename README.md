@@ -1,566 +1,190 @@
-# VOILALab Beam Profiler
+# VOILALab Beam
 
-**VOILALab Beam** is a PyQt6 desktop application for live camera-based laser beam profiling. It displays the beam image and X/Y intensity profiles, calculates beam size and position metrics, monitors pointing stability, records measurements, and supports multi-position beam-propagation analysis.
+**VOILALab Beam** is a free, open-source desktop app that turns a lab camera into a laser beam profiler. It shows the beam live, measures its size and position, tracks drift over time, and measures beam quality (M²) and divergence.
 
-> Current application version reported by the code: **v4.8**
+Current version: **v5.0**
 
-## Key features
+## Features
 
-- Live camera display with selectable false-color maps
-- X- and Y-axis beam intensity profiles
-- Centroid and peak-position crosshairs
-- FWHM and 1/e² threshold widths
-- Gaussian-fit diameters and fit-quality reporting
-- Two-dimensional second-moment (D4σ) measurements
-- Beam major/minor axes, orientation, and ellipticity
-- A/D saturation, background, noise, SNR, clipping, and hot-pixel diagnostics
-- Optional dark-frame subtraction
-- Frame averaging and peak-hold modes
-- Live beam-pointing stability graph
-- CSV measurement logging
-- TIFF, NumPy, and JSON capture output
-- Saved operating presets
-- Multi-position propagation and provisional M² analysis
-- OpenCV, Thorlabs, and UC480 camera backend support
-- Light and dark interface themes
+- Live beam image with a micrometer grid and center markers
+- X and Y brightness profiles, drawn over the image and in separate graphs
+- Beam size by four methods: D4σ (ISO 11146 standard), 1/e², Gaussian fit, and FWHM
+- Beam shape: major/minor axes, rotation angle, and ellipticity
+- Warnings for overexposure, weak signal, hot pixels, and beams cut off at the image edge
+- Dark-frame subtraction and frame averaging
+- Beam drift (pointing stability) graph
+- Measurement logging to a CSV file
+- Image capture (TIFF, NumPy, and a JSON file with the settings and results)
+- Analysis of saved images (Upload Image panel)
+- Beam quality (M²) and divergence from measurements at several distances
+- Saved presets, and light and dark themes
 
-## Important measurement note
-
-This application can perform **ISO-style D4σ and beam-caustic calculations**, but using the software alone does not guarantee ISO 11146 compliance. Reliable results require appropriate camera calibration, background correction, unsaturated and unclipped images, known pixel pitch and wavelength, and adequate measurements on both sides of the beam waist.
-
-This software is not a substitute for laser-safety controls. Follow the safety procedures required by your institution and equipment.
+Supported cameras: Thorlabs scientific cameras (Zelux and others), IDS uEye / Thorlabs DCx (UC480) cameras, and standard webcams (OpenCV). A built-in simulated beam lets you try the app without a camera.
 
 ---
 
 ## Quick start
 
-1. Connect the camera and install any required manufacturer driver or SDK.
-2. Launch the application.
-3. Open **Controls** and select the appropriate camera backend.
-4. Click **Scan for Cameras**, select the device, and click **Connect Camera**.
-5. Enter or verify the camera's **pixel pitch** in the **Calculations** panel.
-6. Adjust exposure until the beam is clearly visible without reaching 100% A/D saturation.
-7. Center the full beam inside the image or calculation area.
-8. Review the X/Y profiles and measurements.
-9. Use **Capture Image** to save the current measurement, or **Start Logging** to record measurements over time.
+**See the PowerPoint tutorial in [docs](docs) for a step-by-step walkthrough with screenshots.**
 
-For best quantitative measurements, capture a dark frame at the same camera settings, enable dark subtraction, avoid clipping at the image or ROI boundary, and keep the camera response within its linear unsaturated range.
+1. Install the camera driver from the manufacturer (not needed for webcams or the simulated beam).
+2. Launch the app.
+3. In **Controls**, choose the camera type (**Backend**), click **Scan**, pick the camera, and click **Connect Camera**.
+4. In **Calculations**, check that **Pixel Pitch** matches your camera's pixel size. All sizes depend on it.
+5. Adjust **Exposure** so the beam is bright but below 100% saturation.
+6. Keep the whole beam inside the image, including its faint edges.
+7. Read the results in **Calculations**. Use **Capture Image** to save a frame or **Start Logging** to record over time.
+
+For the most accurate results, block the beam, click **Capture Dark**, then check **Subtract**.
 
 ---
 
 ## Installation from source
 
-### Required files
-
-Keep these files together in the application directory:
+Keep these files in the same folder:
 
 ```text
 project-folder/
-├── v47_packaging_ready.py
-├── GUI1.ui
-├── app_icon.ico              # optional at runtime
+├── main.py           # the app
+├── GUI1.ui           # required: main window layout
+├── app_icon.ico      # optional
+├── requirements.txt
 └── README.md
 ```
 
-`GUI1.ui` is required because the main window is loaded from this Qt Designer file. The icon is optional; the program falls back to the default Qt icon when it is missing.
-
-### Python requirements
-
-The application imports the following packages:
-
-```text
-PyQt6
-numpy
-opencv-python
-scipy
-matplotlib
-pylablib
-tifffile
-```
-
-Install them in a virtual environment:
+Install Python packages (a virtual environment is recommended):
 
 ```bash
 python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+python -m pip install -r requirements.txt
 ```
 
-Activate the environment on Windows:
+Run:
 
 ```bash
-.venv\Scripts\activate
+python main.py
 ```
 
-Activate it on macOS or Linux:
-
-```bash
-source .venv/bin/activate
-```
-
-Install the dependencies:
-
-```bash
-python -m pip install --upgrade pip
-python -m pip install PyQt6 numpy opencv-python scipy matplotlib pylablib tifffile
-```
-
-Run the application:
-
-```bash
-python v47_packaging_ready.py
-```
-
-The optional Thorlabs and UC480 backends also require compatible camera drivers and SDK support. Installing the Python package alone may not be enough to communicate with the hardware.
-
----
-
-## Interface overview
-
-The main window uses movable and resizable subwindows. Panels can be shown or hidden from either the toolbar or the **View** menu. Closing a panel hides it rather than destroying it, so it can be reopened safely.
-
-### Menu bar
-
-#### File
-
-- **Capture Image** (`Ctrl+S`) — saves the latest displayed frame and its measurement metadata.
-- **Start/Stop Logging** — begins or ends CSV measurement logging.
-- **Save Preset As...** — saves the current application settings under a chosen name.
-- **Load Preset** — applies a previously saved preset.
-- **Delete Preset...** — removes a saved preset.
-- **Exit** (`Ctrl+Q`) — closes the application and safely stops the camera worker.
-
-#### View
-
-Shows or hides the following panels:
-
-- Live Video
-- X Profile
-- Y Profile
-- Controls
-- Calculations
-- Advanced Settings
-- Beam Stability
-- Propagation / M² Analysis
-
-The **Dark Mode** option switches the interface and plots between light and dark themes.
-
-#### Tools
-
-- **Propagation / M² Analysis** — opens the multi-position beam-caustic analysis panel.
-
-#### Help
-
-- **About** — displays application information.
-
-### Toolbar
-
-The toolbar provides quick show/hide buttons for all major panels:
-
-- **Live Video**
-- **X Profile**
-- **Y Profile**
-- **Controls**
-- **Calculations**
-- **Advanced Settings**
-- **Beam Stability**
-- **Propagation / M² Analysis**
-
-A highlighted button means that panel is visible.
-
-### Status bar
-
-The bottom status bar reports:
-
-- camera connection status
-- acquisition and display performance
-- analysis time
-- dropped frames and frame age
-- worker errors
-- the most recent capture
+`pylablib-lightweight` is only needed for IDS uEye / UC480 cameras. Thorlabs cameras also need the Thorlabs camera SDK installed.
 
 ---
 
 ## Panels
 
-## 1. Camera Panel
+Show or hide any panel from the toolbar or the **View** menu. Closing a panel only hides it. **View → Fit Panels to Contents** resizes panels to fit their contents.
 
-The **Camera Panel** displays the live beam image.
+### Camera Panel
+The live beam image. **Zoom** changes only the display, not the measurement. **Snap to Beam** scrolls to the beam when zoomed in. The centroid crosshair marks the beam center; the peak crosshair marks the brightest pixel.
 
-### Snap to Beam
+### Beam Profile (X) and (Y)
+Brightness across the beam, through its center. Shaded bands show the FWHM and 1/e² widths, and a fitted Gaussian curve appears when the fit is good.
 
-Centers the scrollable image view on the latest measured beam centroid. This is particularly useful when the image is zoomed beyond 100%.
+### Controls
+- **Camera:** backend, device, connect. For the simulated beam, set its size and position here.
+- **Acquisition:** exposure, averaged frames, dark frame (Capture Dark, Subtract), Capture Image.
+- **Display:** color map, profile overlay, zoom, and graph units (counts or % of full scale).
 
-### Zoom
+### Calculations
+Beam size from all four methods, beam shape, position, signal quality (saturation, noise, warnings), pixel pitch, and logging. Click **Copy Path** to copy the location of the log file.
 
-Changes only the displayed size of the camera image. It does not change the camera resolution, the recorded raw data, or the calculated beam dimensions.
+**Which width to use?** D4σ is the standard method and works for any beam shape, but it is sensitive to noise and stray light. The Gaussian fit is only meaningful for Gaussian-shaped beams. If the methods disagree a lot, the beam is probably not Gaussian.
 
-### Grid Label Size
+### Advanced Settings
+Settings you rarely change: minimum signal-to-noise, Gaussian fit threshold (R²), hot-pixel masking, restricting the calculation area, maximum display rate, peak hold, wavelength, and power calibration. **Reset to Defaults** restores everything.
 
-Adjusts the size of the sensor-axis gridlines and micrometer labels drawn over the live image.
+Power readout needs a calibration factor measured against a power meter. Entering the wavelength alone does not calibrate power.
 
-### Centroid Crosshair
+### Beam Stability
+Plots how far the beam center moves from the sensor center over time (X positive right, Y positive down). Use it to check drift, vibration, and warm-up. Use logging to keep the data.
 
-Shows or hides the centroid crosshair. The centroid is the intensity-weighted center of the analyzed beam.
+### Upload Image
+Analyzes saved beam images (`.npy`, `.tif`, `.png`, `.bmp`, `.jpg`) with the same calculations as the live camera. Enter the pixel size of the camera that took the image. If a `.json` file with the same name is next to the image (as saved by **Capture Image**), the pixel size is filled in automatically. Use `.npy` or `.tif` for measurements; `.png` and `.jpg` may have lost brightness information.
 
-### Peak Crosshair
-
-Shows or hides the crosshair marking the brightest measured pixel.
-
-### Measured FPS
-
-Reports the achieved frame rate and approximate time per frame. This may be limited by exposure time, camera transfer rate, analysis load, or the maximum display-rate setting.
-
----
-
-## 2. X Profile and Y Profile Panels
-
-These panels show one-dimensional intensity slices through the beam centroid along the camera's horizontal and vertical axes.
-
-Each graph can display:
-
-- **Raw Laser Data** — the measured profile samples
-- **FWHM** — the region above 50% of the profile peak above background
-- **1/e² width** — the region above approximately 13.5% of the profile peak above background
-- **Ideal Gaussian** — the fitted Gaussian curve when the fit passes the configured R² quality threshold
-
-The graph scale can be shown as raw camera counts or as a percentage of the sensor's measured full-scale value.
-
-A Gaussian-fit diameter is meaningful only when the measured profile is sufficiently Gaussian. For non-Gaussian beams, the threshold width and D4σ width may differ substantially from the Gaussian-fit result.
+### Propagation / M² Analysis
+Measures how the beam changes along its path. See below.
 
 ---
 
-## 3. Controls Panel
+## Beam divergence and M²
 
-The **Controls** panel contains frequently used camera and display settings.
+Divergence is how fast the beam spreads as it travels. A single image cannot measure it, because one image only shows the beam size at one distance. VOILALab Beam measures divergence the standard way (ISO 11146): it measures the beam size at several distances and fits how the beam grows.
 
-### Show Graphs as % of Full Scale
+**How to measure:**
 
-Switches the profile graphs between raw digital counts and percentage of the camera's measured full-scale range.
+1. Open **Propagation / M² Analysis** and enter the laser **wavelength (λ)**.
+2. Place the camera at a known distance along the beam and enter it as **Z position** (mm).
+3. Wait until the beam is steady and not saturated, then click **Log Stable Current Measurement**.
+4. Repeat at different distances: some close to the narrowest point (the waist) and some far from it, ideally on both sides. At least 4 positions are required; 10 or more is better.
 
-### Capture Image
+**What you get** (for X and Y):
 
-Saves the exact latest frame used for the on-screen measurement. When **Hold Maximum** is active, it saves the accumulated peak-hold image instead.
+- **M²**: beam quality (1.0 = perfect Gaussian beam)
+- **Waist Ø and z₀**: size and position of the narrowest point
+- **Rayleigh range zR**: the distance over which the beam stays close to its narrowest size
+- **Divergence (full angle, mrad)**: calculated as θ = M²λ / (π w₀) for the half angle, doubled for the full angle
 
-### Camera Exposure
+The graph shades the region near the waist (green) and the far region (red, beyond 2 Rayleigh ranges). Divergence is only reliable when you have points in the far region. The status line tells you if more positions are needed.
 
-The slider provides fast adjustment, while the spin box allows precise entry in milliseconds. Increase exposure for a weak signal and decrease it when the image approaches saturation.
-
-### Color Map
-
-Selects the false-color display map:
-
-- Inferno
-- Jet
-- Hot
-- Magma
-
-The color map affects visualization only. Raw saved intensity values are not colorized.
-
-### Zoom Level
-
-Changes display magnification from 10% to 500%. It mirrors the zoom setting in the Camera Panel.
-
-### Overlay Curve Height
-
-Adjusts the height of the X/Y intensity curves drawn directly over the live video.
-
-### Raw Data Opacity
-
-Changes the visibility of raw sample points in the X/Y profile graphs.
-
-### Camera Selection
-
-1. Select a backend.
-2. Click **Scan for Cameras**.
-3. Select the desired device.
-4. Click **Connect Camera**.
-
-Available backend choices are defined by the application and may include OpenCV-compatible cameras, Thorlabs scientific cameras, and UC480 cameras. Backend availability depends on installed packages, drivers, SDKs, and connected hardware.
+Sessions can be saved and reloaded (JSON) and exported as CSV.
 
 ---
 
-## 4. Calculations Panel
+## Saved files
 
-The **Calculations** panel contains the main quantitative beam measurements.
+**Capture Image** saves, with a timestamped name:
 
-### Pixel Pitch
+| File | Use |
+|---|---|
+| `.tif` | Raw image, full bit depth |
+| `.npy` | Raw image for Python (`np.load`) |
+| `.json` | Settings and results for this capture |
+| `_display16.tif` | Brightened copy for viewing only (not for measurements) |
 
-The physical size of one camera pixel in micrometers. The application attempts to obtain this automatically from supported camera backends, but it should be verified against the camera specification.
-
-All values reported in micrometers depend directly on this setting.
-
-### A/D Saturation
-
-Shows the brightest pixel as a percentage of the analog-to-digital converter's full-scale value. At 100%, at least one pixel is clipped and its true intensity is unknown.
-
-### Threshold 1/e² widths
-
-The X and Y widths measured where the background-subtracted profile crosses 13.5% of its peak. These are direct threshold measurements and do not require the beam to be Gaussian.
-
-### Gaussian diameters
-
-The fitted X and Y 1/e² diameters. These are shown only when the Gaussian fit meets the configured R² threshold.
-
-### Fit shape / R²
-
-Reports how closely each one-dimensional profile follows a Gaussian curve. A result near 1 indicates a close fit; a lower result indicates that a Gaussian diameter may not adequately describe the profile.
-
-### Centroid and peak position
-
-- **Centroid position** — intensity-weighted beam center
-- **Peak position** — location of the brightest pixel
-
-These positions are distinct and may separate when the beam is asymmetric, multimodal, noisy, or affected by a hot pixel.
-
-### FWHM and related beam widths
-
-The panel reports beam widths derived from the X and Y profiles, including threshold-based and fitted values. Read the labels and tooltips carefully because different width definitions are not interchangeable.
-
-### D4σ second-moment measurements
-
-When advanced metrics are enabled, the application calculates two-dimensional second-moment beam dimensions, including:
-
-- D4σ X and Y diameters along the camera axes
-- major- and minor-axis D4σ diameters
-- beam orientation
-- ellipticity
-- truncation and validity status
-
-D4σ is highly sensitive to low-level background, image boundaries, stray light, and distant hot pixels. Treat a truncated or invalid result as unreliable.
-
-### Treat current plane as beam waist
-
-Allows the current measured plane to be treated as the beam waist for a local divergence estimate. Do not enable this unless the camera is actually positioned at, or sufficiently close to, the waist.
-
-### Power readout
-
-The application can estimate total power only after a user-supplied calibration factor is entered in **Advanced Settings**. Wavelength entry alone does not calibrate camera responsivity.
-
-### Start Logging
-
-Creates a timestamped CSV file and records beam measurements periodically. Stop logging before closing or moving the file to ensure it is finalized properly.
+Captures and logs are saved in the folder the app was started from.
 
 ---
 
-## 5. Advanced Settings Panel
+## Validation
 
-These settings are intended for less frequent adjustment.
+The `validation/` folder contains the scripts used to test accuracy on computer-generated beams of known size:
 
-### Reset to Defaults
+1. Run `python generate_synthetic_beams.py` to create the nine test images and `truth.csv`.
+2. In the app, click **Start Logging**, load each `.npy` image in the **Upload Image** panel, then click **Stop Logging**.
+3. Run `python validate_synthetic.py <your_log.csv> truth.csv` to get the percent error for each method (`validation_results.csv`).
 
-Restores the advanced controls to their default values.
-
-### Capture Dark (8 frames)
-
-Captures and averages eight dark images. Block all light from reaching the sensor and keep camera settings unchanged during capture.
-
-### Apply Dark Subtraction
-
-Subtracts the stored dark frame before analysis. A dark frame may be rejected or marked invalid when its camera metadata no longer matches the current acquisition settings.
-
-Capture a new dark frame after changing conditions that materially affect the detector baseline, such as exposure, gain, pixel format, resolution, or camera.
-
-### Minimum Peak SNR
-
-Sets the minimum acceptable peak signal-to-noise ratio used by the application's signal-quality checks.
-
-### Mask isolated hot pixels
-
-Excludes detected isolated hot pixels from analysis. This can prevent a defective pixel far from the beam from strongly distorting centroid or second-moment measurements.
-
-### Enable D4σ / background / hot-pixel analysis
-
-Enables the computationally heavier advanced diagnostics. Disabling it can improve performance while leaving centroid, FWHM, 1/e² width, peak position, and saturation tracking available.
-
-### Gaussian Fit Threshold (R²)
-
-Sets the minimum fit quality required before a Gaussian-fit diameter or related Gaussian result is trusted and displayed.
-
-### Max Display Rate
-
-Caps the interface refresh rate. A camera may acquire faster than the interface is redrawn.
-
-### Averaged Frames
-
-Averages 1–20 recent frames. Higher values reduce random noise but make the display less responsive to beam motion or rapid changes.
-
-### Restrict Calculation Area
-
-Limits analysis to a square region centered around the last known beam position. This can reject distant reflections or artifacts, but the selected area must remain large enough to contain the complete beam and its low-intensity tails.
-
-### Clip Level
-
-Sets the percentage-of-peak threshold used to construct the centroid mask.
-
-### Hold Maximum
-
-Maintains a running per-pixel maximum image. This can capture brief pulses or the envelope of a moving signal. Click **Reset Hold** before starting a new acquisition.
-
-### Instrument PSF
-
-Optionally corrects measured widths for a known instrument point-spread function using quadrature subtraction. Leave this at zero unless the imaging system's PSF has been independently characterized.
-
-### Wavelength
-
-Stores the wavelength for metadata and propagation calculations. It does not automatically correct the camera's wavelength-dependent responsivity.
-
-### Power calibration factor
-
-Converts integrated background-subtracted counts to power. Calibrate this value against a trusted power meter at the actual wavelength, camera, exposure, and optical configuration being used.
-
-### Power unit
-
-Displays calibrated power in µW, mW, or dBm.
+On noise-free test beams, all four width methods were within 0.2% of the true size.
 
 ---
 
-## 6. Beam Stability Panel
+## Notes on accuracy
 
-The **Beam Stability** panel plots centroid movement over time as X and Y offsets from the sensor center in micrometers.
-
-Use it to observe:
-
-- pointing drift
-- vibration
-- warm-up behavior
-- sudden beam movement
-- long-term alignment stability
-
-The graph is a live diagnostic. Use CSV logging when measurements must be retained for later analysis.
+- Avoid saturation (100%) and beams cut off at the image edge. The app warns about both.
+- Check the pixel pitch, and capture a new dark frame after changing exposure or camera.
+- With a noisy image, D4σ can read a few percent low because pixels near the noise level are left out.
+- Using this software does not by itself make a measurement ISO 11146 compliant.
+- This software does not replace laser-safety controls. Follow your institution's laser safety rules.
 
 ---
 
-## 7. Propagation / M² Analysis Panel
+## Building an app (PyInstaller)
 
-This panel fits a beam caustic using measurements collected at several axial positions.
-
-### Recommended workflow
-
-1. Enter the beam wavelength.
-2. Select the width method.
-3. Move the camera, beam, or focusing optic to a known Z position.
-4. Enter that Z coordinate.
-5. Wait until the beam is stable and unsaturated.
-6. Click **Log Stable Current Measurement**.
-7. Repeat at multiple positions on both sides of the waist.
-8. Inspect the fitted curves, residuals, warnings, and reported parameters.
-
-The panel requires recent consistent frames and uses a robust summary rather than a single GUI frame. At least four distinct Z positions are required for a provisional fit; ten or more well-distributed positions are preferable for meaningful coverage.
-
-### Width methods
-
-- **D4σ camera axes** — preferred ISO-style second-moment method
-- **Gaussian-fit 1/e² diameters** — non-ISO comparison method suitable only for sufficiently Gaussian profiles
-
-### Table controls
-
-- **Use** — include or exclude a point from the fit
-- **Delete Selected** — removes selected rows
-- **Clear All** — removes all collected positions
-- **Save Session JSON** — saves the full propagation session
-- **Load Session JSON** — restores a saved session
-- **Export CSV** — exports collected propagation points
-
-Avoid fitting points that are saturated, clipped, unstable, or based on a truncated D4σ calculation.
-
----
-
-## Saved capture files
-
-Each capture uses a timestamped base name such as:
-
-```text
-laser_profile_20260720_101530_123_0000
-```
-
-The application may create:
-
-```text
-laser_profile_... .tif
-laser_profile_... .npy
-laser_profile_... .json
-laser_profile_..._display16.tif
-```
-
-### Raw TIFF
-
-Stores the raw grayscale camera values while preserving the available bit depth.
-
-### NumPy array
-
-Stores the exact image array and data type for later Python analysis.
-
-Load it with:
-
-```python
-import numpy as np
-
-image = np.load("laser_profile_....npy")
-print(image.shape, image.dtype)
-```
-
-### JSON metadata
-
-Stores settings and measurements associated with the capture, including camera backend, exposure, pixel pitch, sensor bit depth, centroid, Gaussian fit information, signal-quality results, dark correction, profiles, and second-moment measurements.
-
-### Display-scaled 16-bit TIFF
-
-When `tifffile` is installed, the application also saves a display-friendly TIFF whose values are shifted to use the 16-bit display range. Use the raw TIFF or NumPy file for quantitative analysis.
-
-By default, captures and logs are written to the application's current working directory. Confirm that this directory is writable and know where the program was launched from.
-
----
-
-## Presets and persistent settings
-
-Presets are stored in:
-
-```text
-beam_profiler_presets.json
-```
-
-The program also uses Qt settings to retain applicable interface and operating choices between sessions.
-
-A preset should document a repeatable operating configuration, but it does not replace hardware calibration. Verify exposure, pixel pitch, dark frame, wavelength, and power calibration after changing cameras or optical arrangements.
-
----
-
-
-## Packaging notes
-
-When building with PyInstaller, include the UI file and icon as data resources. A typical Windows build command is:
+Install PyInstaller (`pip install pyinstaller`), then run:
 
 ```bash
-pyinstaller --noconfirm --clean --windowed --name "VOILALab Beam" \
-  --icon app_icon.ico \
-  --add-data "GUI1.ui;." \
-  --add-data "app_icon.ico;." \
-  v47_packaging_ready.py
+pyinstaller beam_profiler.spec
 ```
 
-On macOS or Linux, use `:` rather than `;` inside `--add-data`:
-
-```bash
---add-data "GUI1.ui:."
-```
-
-Camera SDK libraries may require additional hidden imports, binaries, or manufacturer drivers. Test the packaged application on a clean computer with the intended camera hardware.
-
----
-
-## Documentation
-
-See powerpoint tutorial in docs. [docs](docs)
+The app is created in `dist/VOILALabBeam/`. Test the built app on a clean computer with the camera you plan to use.
 
 ---
 
 ## License
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for the full license terms.
+MIT License. See [LICENSE](LICENSE).
 
-## Citation and authorship
+## Author
 
-```text
-Developed by Jason Liang | VOILA Lab, UC Berkeley
-Contact: Jason Liang, jason.liang2@howardcc.edu
-Project website: https://github.com/cande3ee/VOILALab-Beam
-```
+Developed by Jason Liang, VOILA Lab, UC Berkeley
+Contact: jason.liang2@howardcc.edu
+Project: https://github.com/jasonliang-lab/VOILALab-Beam

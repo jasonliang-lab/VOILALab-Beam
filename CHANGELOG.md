@@ -2,7 +2,7 @@
 
 All notable changes to VOILALab Beam are listed here, newest first.
 
-## [Unreleased] (planned v5.0)
+## [5.0] - 2026-11-01
 
 ### Added
 - **Demo / Simulated Camera.** An ideal, noise-free Gaussian beam with an adjustable 1/e² diameter. You can try the app without a laser or camera, and it gives a beam of known size for checking the measurements.
@@ -15,13 +15,19 @@ All notable changes to VOILALab Beam are listed here, newest first.
   - Identifiability diagnostics explain in plain language when the fit is poorly constrained.
   - "Finalize Analysis" computes bootstrap 95% confidence intervals for w0, z0, and M².
   - Choice of width method for the fit, separate raw and aggregated CSV export, and a "How to use / caveats" guide.
+- **Synthetic validation scripts** (`validation/`): generate test beams of known size and compare the app's measurements with the true values.
+- Logging of uploaded images: each loaded image is written to the log with its file name, Gaussian-fit diameters, and status.
+- **View > Fit Panels to Contents,** and panels resize automatically to fit their contents (the camera and graph panels are not changed).
+- Profile overlay can be drawn along the image edges, in yellow (X) and cyan (Y), with an option to hide the flat tails.
+- Copy Path button for the log file; long log paths now wrap.
 - Hover tooltips for pixel values, warnings, and explanations of each measurement method.
 
 ### Changed
 - **D4σ now follows the ISO 11146 approach:** an iterative integration area centered on the beam, a robust border-based background estimate, and a noise-floor threshold. Previously it was a single pass with a fixed low-percentile background, which made it very sensitive to background noise.
-- **Calculations panel redesigned:** a Beam Size table (D4σ, 1/e², Gaussian fit with R², FWHM; X and Y side by side), plus Shape, Position, Signal Quality, Divergence, and Setup sections.
-- **Controls panel reorganized** in the order you use it: Camera, Acquisition, Display, Graphs.
-- **Advanced Settings reorganized** into Analysis, Dark Frame, Calculation Area, Acquisition, and Calibration, with Reset to Defaults moved to the bottom.
+- **Calculations panel redesigned:** a Beam Size table (D4σ, 1/e², Gaussian fit with R², FWHM; X and Y side by side), plus Shape, Position, Signal Quality, and Setup sections.
+- **Controls panel reorganized** in the order you use it: Camera, Acquisition, Display, Graphs. Averaged frames and the dark frame (Capture Dark, Subtract) moved here from Advanced Settings.
+- **Advanced Settings reorganized** into Analysis, Calculation Area, Acquisition, and Calibration, with Reset to Defaults moved to the bottom.
+- Light mode uses neutral grays, with scrollbars and panel borders that match each theme. Dark mode keeps its original look.
 - Matching blue section headers, label-left layout, and a uniform background across panels in light and dark mode.
 - Controls that do not apply to the current camera source are disabled automatically (for example, exposure for the demo camera).
 - Settings are stored in one place, so loading and Reset to Defaults always agree.
@@ -35,3 +41,5 @@ All notable changes to VOILALab Beam are listed here, newest first.
 
 ### Removed
 - The "Clip Level (% of peak)" setting. D4σ now uses the noise-floor threshold above instead of clipping.
+- The single-image divergence estimate ("Treat current plane as beam waist"). It assumed the camera was exactly at the waist and M² = 1. Divergence is now measured in the Propagation / M² panel from several distances.
+- The "Enable D4σ / background / hot-pixel analysis" checkbox. This analysis is now always on.

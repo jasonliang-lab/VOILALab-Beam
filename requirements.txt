@@ -1,6 +1,6 @@
 PyQt6
 numpy
-opencv-python
+opencv-python-headless
 scipy
 matplotlib
 tifffile

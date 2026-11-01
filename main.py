@@ -3,6 +3,7 @@ import os
 import time
 import csv
 import json
+import html
 import uuid
 import collections
 import threading
@@ -17,9 +18,12 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QDoubleSpinBox, QSpinBox, QComboBox, QScrollArea,
                              QCheckBox, QMessageBox, QInputDialog, QMdiSubWindow,
                              QTableWidget, QTableWidgetItem, QHeaderView, QFileDialog,
-                             QGroupBox, QFormLayout, QAbstractItemView)
-from PyQt6.QtCore import QTimer, Qt, QSettings, QObject, QThread, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QImage, QPixmap, QAction, QIcon, QColor
+                             QGroupBox, QFormLayout, QAbstractItemView, QSplitter,
+                             QToolButton, QMenu, QDialog, QDialogButtonBox, QProxyStyle, QSizePolicy,
+                             QStyle)
+from PyQt6.QtCore import (QTimer, Qt, QSettings, QObject, QThread, QEvent, QItemSelectionModel,
+                          pyqtSignal, pyqtSlot)
+from PyQt6.QtGui import QImage, QPixmap, QAction, QIcon, QColor, QBrush, QRegion
 from PyQt6 import uic
 
 def resource_path(relative_path):
@@ -89,10 +93,186 @@ OVERLAY_CROSSHAIR_BIG_BASE_PX = 34
 OVERLAY_CROSSHAIR_SMALL_BASE_PX = 16
 OVERLAY_CROSSHAIR_CENTROID_THICK_BASE_PX = 3
 OVERLAY_CROSSHAIR_THICK_BASE_PX = 1
+# Profile-overlay colors (RGB, because the display image is RGB). Yellow and
+# cyan stay distinguishable for red-green colorblind viewers and avoid the
+# crosshair colors (green = centroid, red = peak) and the white grid. A dark
+# outline is drawn under each curve/label so they stay visible on every
+# color map, including where they cross the bright beam.
+OVERLAY_X_CURVE_RGB = (255, 255, 0)
+OVERLAY_Y_CURVE_RGB = (0, 255, 255)
+OVERLAY_OUTLINE_RGB = (0, 0, 0)
+OVERLAY_EDGE_MARGIN_BASE_PX = 6
+OVERLAY_EDGE_MAX_HEIGHT_FRAC = 0.45
+AVERAGING_TIP = ("Average this many consecutive frames before analysis. Reduces random "
+                 "noise on live video; not applicable to an uploaded image.")
+DARK_CAPTURE_TIP = ("Block the laser, then click: averages 8 frames as the dark frame "
+                    "(camera offset, hot pixels, stray light). Recapture after changing exposure.")
+DARK_APPLY_TIP = "Subtract the captured dark frame from every frame before analysis."
+OVERLAY_ANCHOR_CENTER = "Through beam center"
+OVERLAY_ANCHOR_EDGES = "Image edges"
+# "Hide profile tails": stop drawing a curve where it falls below this
+# fraction of its peak, so only the bell shape near the beam is shown.
+OVERLAY_TAIL_CUTOFF = 0.001
+# Single source of truth for the color-map dropdown and its OpenCV maps
+# ("Grayscale" has no OpenCV map: it uses an identity lookup table).
+COLORMAP_CHOICES = ("Inferno", "Jet", "Hot", "Magma", "Grayscale")
+CV_COLORMAPS = {
+    "Inferno": cv2.COLORMAP_INFERNO,
+    "Jet": cv2.COLORMAP_JET,
+    "Hot": cv2.COLORMAP_HOT,
+    "Magma": cv2.COLORMAP_MAGMA,
+}
 
 STALE_FRAME_LIMIT = 15
 
-DARK_QSS = """
+# ---------------------------------------------------------------------------
+# Themes.
+#  - Light mode: the stylesheet is built from THEME_QSS_TEMPLATE below, with
+#    colors referenced as $name (string.Template, because QSS itself uses
+#    curly braces) and filled in from THEMES["light"].
+#  - Dark mode: uses the ORIGINAL dark stylesheet unchanged (LEGACY_DARK_QSS),
+#    so THEMES["dark"] only holds the colors that code reads directly at run
+#    time (graphs, panel frame, saturation/status text).
+# ---------------------------------------------------------------------------
+THEMES = {
+    "dark": {
+        "ok": "#3cb371",
+        "warn": "#e0a030",
+        "error": "#e04040",
+        "plot_face": "#2b2b2b", "plot_axes": "#2b2b2b", "plot_text": "#e0e0e0", "plot_grid": "#555555",
+        "frame_fill": "#333333", "frame_line": "#555555",
+        "prop_face": "white", "prop_axes": "white", "prop_text": "black", "prop_grid": "#b0b0b0",
+        "prop_ok": "#2e7d32", "prop_warn": "#b36b00", "error_strong": "red",
+    },
+    "light": {
+        # Neutral grays based on the standard macOS light appearance
+        # (window #ECECEC, controls #FFFFFF); no blue tint in the grays.
+        "workspace": "#a8a8a8",
+        "panel": "#ececec",
+        "field": "#ffffff",
+        "field_hover": "#f2f2f2",
+        "table_bg": "#ffffff",
+        "border": "#b0b0b0",
+        "divider": "rgba(0,0,0,0.15)",
+        "text": "#1d1d1f",
+        "text_secondary": "#636366",
+        "text_disabled": "#a1a1a6",
+        "accent": "#3a7bd5",
+        "accent_border": "#2f6bc0",
+        "accent_text": "#2a62b3",
+        "ok": "#1e7a46",
+        "warn": "#9a5b00",
+        "error": "#c62828",
+        "warnbox_bg": "#fff3cd", "warnbox_fg": "#5f4700", "warnbox_border": "#d8bd68",
+        "indicator_bg": "#ffffff", "indicator_border": "#7c7c80", "indicator_hover": "#636366",
+        "indicator_disabled_bg": "#ececec", "indicator_disabled_border": "#c6c6c6",
+        "indicator_checked_disabled": "#a9c1e6",
+        "plot_face": "#ececec", "plot_axes": "#ffffff", "plot_text": "#1d1d1f", "plot_grid": "#d0d0d0",
+        "scroll_handle": "#7c7c80", "scroll_handle_hover": "#636366",
+        "frame_fill": "#ececec", "frame_line": "#8e8e8e",
+        "prop_face": "#ececec", "prop_axes": "#ffffff", "prop_text": "#1d1d1f", "prop_grid": "#b0b0b0",
+        "prop_ok": "#1e7a46", "prop_warn": "#9a5b00", "error_strong": "#c62828",
+    },
+}
+CURRENT_THEME = "light"
+
+
+def theme_color(key):
+    """Color from the active theme (used by code that sets colors at run
+    time, e.g. the saturation readout and the propagation status line)."""
+    return THEMES[CURRENT_THEME][key]
+
+
+THEME_QSS_TEMPLATE = """
+QMainWindow, QWidget { background-color: $panel; color: $text; }
+QMdiSubWindow { background-color: $panel; color: $text; }
+QScrollArea { background-color: $workspace; }
+QLabel { color: $text; }
+QPushButton {
+    background-color: $field; color: $text; border: 1px solid $border;
+    border-radius: 4px; padding: 4px 8px;
+}
+QPushButton:hover { background-color: $field_hover; }
+QPushButton:checked { background-color: $accent; border: 1px solid $accent_border; color: #ffffff; }
+QPushButton:disabled { color: $text_disabled; }
+QSlider::groove:horizontal { background: $border; height: 4px; border-radius: 2px; }
+QSlider::handle:horizontal { background: $accent; width: 12px; margin: -6px 0; border-radius: 6px; }
+QComboBox, QSpinBox, QDoubleSpinBox {
+    background-color: $field; color: $text; border: 1px solid $border; border-radius: 3px; padding: 2px;
+}
+QComboBox QAbstractItemView {
+    background-color: $field; color: $text;
+    selection-background-color: $accent; selection-color: #ffffff;
+}
+QTableView { background-color: $table_bg; color: $text; gridline-color: $border; }
+QHeaderView::section {
+    background-color: $panel; color: $text; padding: 2px 4px;
+    border: none; border-right: 1px solid $border; border-bottom: 1px solid $border;
+}
+QTableCornerButton::section { background-color: $panel; border: none; }
+QScrollBar:vertical { background: $panel; width: 12px; margin: 0; border: none; }
+QScrollBar:horizontal { background: $panel; height: 12px; margin: 0; border: none; }
+QScrollBar::handle:vertical { background: $scroll_handle; min-height: 28px; border-radius: 4px; margin: 2px 3px; }
+QScrollBar::handle:horizontal { background: $scroll_handle; min-width: 28px; border-radius: 4px; margin: 3px 2px; }
+QScrollBar::handle:hover { background: $scroll_handle_hover; }
+QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; border: none; background: none; }
+QScrollBar::add-page, QScrollBar::sub-page { background: none; }
+QAbstractScrollArea::corner { background: $panel; }
+QToolTip { background-color: $field; color: $text; border: 1px solid $border; padding: 3px; }
+QCheckBox { color: $text; }
+QMenuBar { background-color: $panel; color: $text; }
+QMenuBar::item:selected { background-color: $accent; color: #ffffff; }
+QMenu { background-color: $panel; color: $text; border: 1px solid $border; }
+QMenu::item:selected { background-color: $accent; color: #ffffff; }
+QToolBar { background-color: $panel; border: none; spacing: 2px; }
+QToolButton {
+    background-color: $field; color: $text; border: 1px solid $border;
+    border-radius: 4px; padding: 4px 6px; margin: 2px;
+}
+QToolButton:hover { background-color: $field_hover; }
+QToolButton:checked { background-color: $accent; border: 1px solid $accent_border; color: #ffffff; }
+QToolBar QToolButton { font-size: 13pt; }
+
+QTableView::indicator, QCheckBox::indicator {
+    width: 14px; height: 14px; border: 1px solid $indicator_border;
+    border-radius: 3px; background-color: $indicator_bg;
+}
+QTableView::indicator:hover, QCheckBox::indicator:hover { border: 1px solid $indicator_hover; }
+QTableView::indicator:checked, QCheckBox::indicator:checked {
+    background-color: $accent; border: 1px solid $accent_border;
+    image: url("$check");
+}
+QCheckBox::indicator:disabled {
+    background-color: $indicator_disabled_bg; border: 1px solid $indicator_disabled_border;
+}
+QCheckBox::indicator:checked:disabled {
+    background-color: $indicator_checked_disabled; border: 1px solid $indicator_disabled_border;
+}
+
+QLabel[role="section"] {
+    color: $accent_text; border-bottom: 1px solid $divider; padding-top: 6px; padding-bottom: 2px;
+}
+QLabel[role="hint"] { color: $text_secondary; }
+QLabel[role="ok"] { color: $ok; }
+QLabel[role="warn"] { color: $warn; }
+QLabel[role="warnbox"] {
+    background-color: $warnbox_bg; color: $warnbox_fg; padding: 5px; border: 1px solid $warnbox_border;
+}
+QLabel[role="stats"] { color: $text_secondary; font-size: 11px; background: transparent; }
+QPushButton[role="primary"] {
+    background-color: $accent; color: #ffffff; border: 1px solid $accent_border;
+    border-radius: 4px; padding: 5px; font-weight: bold;
+}
+QPushButton[role="primary"]:hover { background-color: #4a8be5; }
+QPushButton[role="primary"]:disabled { background-color: $field; color: $text_disabled; border: 1px solid $border; }
+"""
+
+
+# The ORIGINAL dark-mode stylesheet, unchanged (the dark theme is kept exactly
+# as it was before the light-theme rework). Only the per-label "role" rules
+# below are new; they reproduce the colors those labels had before, when each
+# label set its own stylesheet.
+LEGACY_DARK_QSS = """
 QMainWindow, QWidget { background-color: #2b2b2b; color: #e0e0e0; }
 QMdiArea { background-color: #1e1e1e; }
 QLabel { color: #e0e0e0; }
@@ -123,25 +303,112 @@ QToolButton:checked {
 }
 QMdiSubWindow { background-color: #333333; color: #e0e0e0; }
 QScrollArea { background-color: #1e1e1e; }
+QToolBar QToolButton { font-size: 13pt; }
+
+QTableView::indicator {
+    width: 14px; height: 14px; border: 1px solid #8a8a8a;
+    border-radius: 3px; background-color: #3c3f41;
+}
+QTableView::indicator:hover { border: 1px solid #b0b0b0; }
+QTableView::indicator:checked {
+    background-color: #3a7bd5; border: 1px solid #7fb0ff;
+    image: url("$check");
+}
+QCheckBox::indicator {
+    width: 14px; height: 14px; border: 1px solid #8a8a8a;
+    border-radius: 3px; background-color: #3c3f41;
+}
+QCheckBox::indicator:hover { border: 1px solid #b0b0b0; }
+QCheckBox::indicator:checked {
+    background-color: #3a7bd5; border: 1px solid #7fb0ff;
+    image: url("$check");
+}
+QCheckBox::indicator:disabled { background-color: #2b2b2b; border: 1px solid #555555; }
+QCheckBox::indicator:checked:disabled { background-color: #34506f; border: 1px solid #555555; }
+
+QLabel[role="section"] {
+    color: #3a7bd5; border-bottom: 1px solid rgba(128,128,128,90); padding-top: 6px; padding-bottom: 2px;
+}
+QLabel[role="hint"] { color: gray; }
+QLabel[role="ok"] { color: #3fa86b; }
+QLabel[role="warn"] { color: #b36b00; }
+QLabel[role="warnbox"] { background: #fff3cd; color: #5f4700; padding: 5px; border: 1px solid #d8bd68; }
+QLabel[role="stats"] { color: gray; font-size: 11px; background: transparent; }
+QPushButton[role="primary"] {
+    background-color: #3a7bd5; color: white; border: 1px solid #5a9bf5;
+    border-radius: 4px; padding: 5px; font-weight: bold;
+}
+QPushButton[role="primary"]:hover { background-color: #4a8be5; }
+QPushButton[role="primary"]:disabled { background-color: #555555; color: #999999; }
+
+QScrollBar:vertical { background: #2b2b2b; width: 12px; margin: 0; border: none; }
+QScrollBar:horizontal { background: #2b2b2b; height: 12px; margin: 0; border: none; }
+QScrollBar::handle:vertical { background: #7a7f85; min-height: 28px; border-radius: 4px; margin: 2px 3px; }
+QScrollBar::handle:horizontal { background: #7a7f85; min-width: 28px; border-radius: 4px; margin: 3px 2px; }
+QScrollBar::handle:hover { background: #9aa0a6; }
+QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; border: none; background: none; }
+QScrollBar::add-page, QScrollBar::sub-page { background: none; }
+QAbstractScrollArea::corner { background: #2b2b2b; }
 """
 
-LIGHT_QSS = """
-QToolBar { border: none; spacing: 2px; }
-QToolButton {
-    background-color: #f2f2f2; color: #202020; border: 1px solid #b5b5b5;
-    border-radius: 4px; padding: 4px 6px; margin: 2px;
-}
-QToolButton:hover { background-color: #e2e2e2; }
-QToolButton:checked {
-    background-color: #3a7bd5; border: 1px solid #7fb0ff; color: #ffffff;
-}
-"""
-# Shared by both themes, so the toolbar font is identical in light and dark mode.
-TOOLBAR_FONT_QSS = """
-QToolBar QToolButton { font-size: 13pt; }
-"""
-DARK_QSS += TOOLBAR_FONT_QSS
-LIGHT_QSS += TOOLBAR_FONT_QSS
+
+def build_theme_qss(theme_name):
+    """Full application stylesheet for 'dark' or 'light'."""
+    from string import Template
+    colors = dict(THEMES[theme_name])
+    check = make_checkmark_images()
+    if theme_name == "dark":
+        qss = Template(LEGACY_DARK_QSS).substitute(check=check or "")
+        if check is None:
+            qss = qss.replace('\n    image: url("");', "")
+        return qss
+    qss = Template(THEME_QSS_TEMPLATE).substitute(colors, check=check or "")
+    if check is None:
+        # No image: checked boxes still show as solid accent-colored squares.
+        qss = qss.replace('\n    image: url("");', "")
+    return qss
+
+
+_CHECKMARK_IMAGE_PATH = None
+
+
+def make_checkmark_images():
+    """Draw a white checkmark and save it as check.png (14 px) plus
+    check@2x.png (28 px, picked up automatically on Retina screens) in the
+    temp folder. Returns the 1x path with forward slashes (needed by QSS on
+    Windows too), or None if the images could not be written. Cached after
+    the first successful call. Must be called after QApplication exists."""
+    global _CHECKMARK_IMAGE_PATH
+    if _CHECKMARK_IMAGE_PATH is not None:
+        return _CHECKMARK_IMAGE_PATH
+    try:
+        import tempfile
+        from PyQt6.QtGui import QPainter, QPen
+        from PyQt6.QtCore import QPointF
+        folder = os.path.join(tempfile.gettempdir(), "voilalab_beam_ui")
+        os.makedirs(folder, exist_ok=True)
+        base = os.path.join(folder, "check.png")
+        for scale, path in ((1, base), (2, os.path.join(folder, "check@2x.png"))):
+            size = 14 * scale
+            pixmap = QPixmap(size, size)
+            pixmap.fill(QColor(0, 0, 0, 0))
+            painter = QPainter(pixmap)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            pen = QPen(QColor("white"))
+            pen.setWidthF(2.0 * scale)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            painter.setPen(pen)
+            painter.drawPolyline([QPointF(3.0 * scale, 7.5 * scale),
+                                  QPointF(6.0 * scale, 10.5 * scale),
+                                  QPointF(11.0 * scale, 3.5 * scale)])
+            painter.end()
+            if not pixmap.save(path, "PNG"):
+                return None
+        _CHECKMARK_IMAGE_PATH = base.replace("\\", "/")
+        return _CHECKMARK_IMAGE_PATH
+    except Exception:
+        return None
 
 
 @dataclass(frozen=True)
@@ -378,6 +645,9 @@ class PropagationSample:
     wavelength_nm: float = 0.0
     source_frame_count: int = 1
     width_cv_percent: float | None = None
+    # Order in which this point was logged (1, 2, 3, ...). Shown as the row
+    # number; kept so sorting the table by Z never loses the logging order.
+    log_order: int | None = None
 
 
 @dataclass(frozen=True)
@@ -498,6 +768,10 @@ def aggregate_replicates(samples, z_tol_mm=0.01):
 
     return [_merge_replicate_group(group) for group in groups]
 
+
+# A fitted M^2 within this distance of 1.0 is treated as "consistent with an
+# ideal Gaussian" rather than as a physically impossible (< 1) result.
+M2_IDEAL_TOLERANCE = 0.02
 
 PROPAGATION_SCOPE_NOTE = (
     "Current propagation analysis fits camera X and Y independently and is "
@@ -919,11 +1193,25 @@ def propagation_radius_model(z_mm, w0_um, z0_mm, m2, wavelength_nm):
     return w0_um * np.sqrt(1.0 + term * term)
 
 
-def bounds_hit(popt, lower, upper, rel_tol=0.01, names=("w0", "z0", "m2")):
+def bounds_hit(popt, lower, upper, rel_tol=0.01, names=("w0", "z0", "m2"), abs_tol=None):
+    """Report parameters sitting at an optimizer bound.
+
+    `abs_tol` gives an absolute tolerance per parameter name. It matters for
+    M^2, whose bounds (0.2 .. 100) are so wide that a 1%-of-span rule would
+    flag every M^2 below ~1.2 -- i.e. every good beam -- as "at the lower
+    bound"."""
+    abs_tol = abs_tol or {}
     hits = []
     for name, val, lo, hi in zip(names, popt, lower, upper):
         span = hi - lo
         if span <= 0:
+            continue
+        if name in abs_tol:
+            tol = float(abs_tol[name])
+            if val - lo < tol:
+                hits.append((name, "lower"))
+            elif hi - val < tol:
+                hits.append((name, "upper"))
             continue
         if (val - lo) / span < rel_tol:
             hits.append((name, "lower"))
@@ -1050,15 +1338,58 @@ def describe_identifiability(fit):
     m2, m2_error = fit["m2"], fit["m2_error"]
     if np.isfinite(m2_error) and m2 > 0:
         relative_m2_uncertainty = m2_error / m2
-        crosses_unphysical = (m2 - m2_error) <= 1.0
-        if relative_m2_uncertainty > 0.5 or crosses_unphysical:
+        # Only a genuinely large relative uncertainty is a problem. An
+        # interval that merely touches M^2 = 1 is normal for a near-ideal
+        # beam and is NOT flagged here.
+        if relative_m2_uncertainty > 0.5:
             detail = f"M² = {m2:.2f} ± {m2_error:.2f} ({100*relative_m2_uncertainty:.0f}% relative)"
-            if crosses_unphysical:
-                detail += "; this range includes M² ≤ 1"
             reasons.append(f"M² confidence interval is very broad ({detail})")
     if not reasons:
         return "Parameters appear reasonably well constrained by this dataset."
     return "Poorly constrained: " + "; ".join(reasons) + "."
+
+
+def fit_checks(fit):
+    """Single source of truth for one axis's pass/fail state.
+
+    Returns {"ok", "issues", "details", "coverage"}: `issues` are short,
+    prioritized strings for the status line; `details` are full sentences
+    for the Diagnostics section."""
+    if fit is None:
+        return {"ok": False, "issues": ["fit failed or insufficient independent data"],
+                "details": [], "coverage": None}
+    summary = coverage_summary(fit["zones"], fit["unique_planes"])
+    ident_text = describe_identifiability(fit)
+    z_r = fit["z_r_mm"]
+    issues = []
+    if not fit["model_constraints_satisfied"]:
+        issues.append(f"M² < 1 ({fit['m2']:.2f}): check pixel pitch, wavelength, or background")
+    if summary["needs_more_far"]:
+        issues.append(f"need {4 - summary['far_total']} more far-field plane(s) "
+                      f"(|z − z₀| ≥ {2 * z_r:.0f} mm)")
+    if summary["needs_more_near"]:
+        issues.append(f"need {4 - summary['near_total']} more near-waist plane(s) "
+                      f"(|z − z₀| ≤ {z_r:.0f} mm)")
+    if fit["unique_planes"] < 10:
+        issues.append(f"need {10 - fit['unique_planes']} more Z plane(s) (target ≥ 10)")
+    if not ident_text.startswith("Parameters appear"):
+        issues.append("fit poorly constrained, see Diagnostics")
+
+    weighted_note = ("Weighted by replicate/frame repeatability (relative weighting only, "
+                     "not a calibrated absolute uncertainty)." if fit["weighted"] else "Unweighted fit.")
+    m2_note = (f"M² = {fit['m2']:.3f} ± {fit['m2_error']:.3f}"
+               + (" (consistent with an ideal Gaussian beam, M² = 1)." if fit.get("m2_near_ideal") else "."))
+    details = [
+        describe_coverage(summary),
+        ident_text,
+        m2_note,
+        f"Waist position z₀ = {fit['z0_mm']:.4g} ± {fit['z0_error_mm']:.3g} mm; "
+        f"w₀ = {fit['w0_um']:.1f} ± {fit['w0_error_um']:.2g} µm.",
+        weighted_note,
+        f"Fit constraints satisfied (M² ≥ {1.0 - M2_IDEAL_TOLERANCE:.2f}, w₀ > 0): "
+        f"{fit['model_constraints_satisfied']}.",
+    ]
+    return {"ok": not issues, "issues": issues, "details": details, "coverage": summary}
 
 
 def fit_propagation_axis(z_mm, diameter_um, wavelength_nm, spread_um=None):
@@ -1152,7 +1483,10 @@ def fit_propagation_axis(z_mm, diameter_um, wavelength_nm, spread_um=None):
     # fit landing below 1 is diagnostic evidence of a measurement problem
     # (bad background, truncation, wrong width method) and should be
     # visible rather than clamped away by the optimizer's own bounds.
-    model_constraints_satisfied = bool(m2 >= 1.0 and w0 > 0 and z_r_mm > 0 and np.all(np.isfinite(popt)))
+    # A small tolerance below 1.0 is allowed so an ideal beam (true M^2 = 1)
+    # that fits to e.g. 0.999 is not reported as violating M^2 >= 1.
+    model_constraints_satisfied = bool(m2 >= 1.0 - M2_IDEAL_TOLERANCE and w0 > 0
+                                       and z_r_mm > 0 and np.all(np.isfinite(popt)))
 
     return {
         "w0_um": w0, "z0_mm": z0, "m2": m2,
@@ -1165,8 +1499,9 @@ def fit_propagation_axis(z_mm, diameter_um, wavelength_nm, spread_um=None):
         "weighted": weighted, "sigma_kind": "relative_repeatability" if weighted else None,
         "left_sampled": left, "right_sampled": right,
         "model_constraints_satisfied": model_constraints_satisfied,
+        "m2_near_ideal": bool(abs(m2 - 1.0) <= M2_IDEAL_TOLERANCE),
         "identifiability": identifiability_diagnostics(pcov),
-        "bounds_hit": bounds_hit(popt, lower, upper),
+        "bounds_hit": bounds_hit(popt, lower, upper, abs_tol={"m2": 0.05}),
         "zones": zones, "unique_planes": int(z.size),
         "z": z, "observed_radius_um": w, "predicted_radius_um": predicted,
         "_lower_bounds": lower, "_upper_bounds": upper, "_sigma": sigma,
@@ -1238,12 +1573,6 @@ def r_squared(observed, predicted):
 
 def gaussian_1e2_diameter(popt):
     return 4.0 * abs(popt[2])
-
-
-def divergence_half_angle_mrad(w0_um, wavelength_nm):
-    if w0_um is None or w0_um <= 0 or wavelength_nm is None or wavelength_nm <= 0:
-        return None
-    return wavelength_nm / (np.pi * w0_um)
 
 
 def correct_for_instrument_psf(measured_um, psf_um):
@@ -1644,7 +1973,28 @@ class DemoCameraBackend(CameraBackend):
     PEAK_COUNTS = round(0.75 * ((2 ** BIT_DEPTH) - 1))  # ~3071 of 4095, fixed forever
     MAX_FPS = 60.0
 
-    def __init__(self, diameter_um=500.0):
+    # Default beam position as a fraction of the frame (upper right).
+    DEFAULT_CENTER_FRAC_X = 0.70
+    DEFAULT_CENTER_FRAC_Y = 0.30
+
+    # Beam position convention (matches the camera grid and the Stability
+    # panel): origin at the sensor center, +X to the right, +Y DOWNWARD,
+    # in micrometers. The sensor center in pixel-index coordinates is
+    # ((W - 1) / 2, (H - 1) / 2).
+    @classmethod
+    def center_limits_um(cls):
+        """Largest |x|, |y| offset (um) that keeps the beam center on the sensor."""
+        return ((cls.WIDTH_PX - 1) / 2.0 * cls.PIXEL_PITCH_UM,
+                (cls.HEIGHT_PX - 1) / 2.0 * cls.PIXEL_PITCH_UM)
+
+    @classmethod
+    def default_center_um(cls):
+        half_w = (cls.WIDTH_PX - 1) / 2.0
+        half_h = (cls.HEIGHT_PX - 1) / 2.0
+        return ((cls.DEFAULT_CENTER_FRAC_X * (cls.WIDTH_PX - 1) - half_w) * cls.PIXEL_PITCH_UM,
+                (cls.DEFAULT_CENTER_FRAC_Y * (cls.HEIGHT_PX - 1) - half_h) * cls.PIXEL_PITCH_UM)
+
+    def __init__(self, diameter_um=500.0, center_x_um=None, center_y_um=None):
         self._diameter_um = float(diameter_um)
         self._exposure_ms = 5.0
         self._dark_mode = False
@@ -1652,8 +2002,10 @@ class DemoCameraBackend(CameraBackend):
         yy, xx = np.mgrid[0:self.HEIGHT_PX, 0:self.WIDTH_PX]
         self._xx = xx.astype(np.float64)
         self._yy = yy.astype(np.float64)
-        self._cx = 0.70 * (self.WIDTH_PX - 1)
-        self._cy = 0.30 * (self.HEIGHT_PX - 1)
+        self._cx = self.DEFAULT_CENTER_FRAC_X * (self.WIDTH_PX - 1)
+        self._cy = self.DEFAULT_CENTER_FRAC_Y * (self.HEIGHT_PX - 1)
+        if center_x_um is not None and center_y_um is not None:
+            self.set_beam_center_um(center_x_um, center_y_um)
 
     def open(self):
         pass
@@ -1673,6 +2025,23 @@ class DemoCameraBackend(CameraBackend):
     def set_beam_diameter_um(self, diameter_um):
         if diameter_um > 0:
             self._diameter_um = float(diameter_um)
+
+    def set_beam_center_um(self, x_um, y_um):
+        """Move the beam center. Offsets are from the sensor center, +Y down;
+        clamped so the center always stays on the sensor (the beam itself may
+        still extend past the edge, which is how truncation can be tested)."""
+        half_w = (self.WIDTH_PX - 1) / 2.0
+        half_h = (self.HEIGHT_PX - 1) / 2.0
+        cx = half_w + float(x_um) / self.PIXEL_PITCH_UM
+        cy = half_h + float(y_um) / self.PIXEL_PITCH_UM
+        self._cx = min(max(cx, 0.0), self.WIDTH_PX - 1.0)
+        self._cy = min(max(cy, 0.0), self.HEIGHT_PX - 1.0)
+
+    def get_beam_center_um(self):
+        half_w = (self.WIDTH_PX - 1) / 2.0
+        half_h = (self.HEIGHT_PX - 1) / 2.0
+        return ((self._cx - half_w) * self.PIXEL_PITCH_UM,
+                (self._cy - half_h) * self.PIXEL_PITCH_UM)
 
     def get_frame(self):
         # Pace like a real camera would: exposure sets the floor, but never
@@ -1708,7 +2077,9 @@ class DemoCameraBackend(CameraBackend):
                 f"pixel pitch {self.PIXEL_PITCH_UM} um\n"
                 f"Bit depth: {self.BIT_DEPTH}-bit (uint16), peak fixed at "
                 f"{self.PEAK_COUNTS} counts\n"
-                f"Simulated 1/e^2 diameter: {self._diameter_um:.1f} um")
+                f"Simulated 1/e^2 diameter: {self._diameter_um:.1f} um\n"
+                f"Beam center (from sensor center, +Y down): "
+                f"({self.get_beam_center_um()[0]:.1f}, {self.get_beam_center_um()[1]:.1f}) um")
 
     @staticmethod
     def list_available_devices():
@@ -1718,6 +2089,11 @@ class DemoCameraBackend(CameraBackend):
 UPLOAD_MAX_DIMENSION_WARN_PX = 2048
 UPLOAD_IMAGE_EXTENSIONS_NPY = (".npy",)
 UPLOAD_IMAGE_EXTENSIONS_RASTER = (".tif", ".tiff", ".png", ".bmp", ".jpg", ".jpeg")
+
+
+# Start of the "sidecar found and valid" message. UploadImagePanel uses it
+# to show that message as a green confirmation instead of an orange warning.
+SIDECAR_OK_PREFIX = "VOILALab sidecar detected"
 
 
 def detect_upload_metadata(path, channel="luminance"):
@@ -1807,7 +2183,7 @@ def detect_upload_metadata(path, channel="luminance"):
                     sensor_max_raw = int(smr)
                     sensor_saturation_known = True
                     warnings_out.append(
-                        f"VOILALab sidecar detected: image scale {pixel_pitch_um:.3f} \u00b5m/px, "
+                        f"{SIDECAR_OK_PREFIX}: image scale {pixel_pitch_um:.3f} \u00b5m/px, "
                         f"{sensor_bit_depth}-bit sensor (trusted)."
                     )
                 else:
@@ -1988,9 +2364,13 @@ CAMERA_BACKEND_NAMES = [
 SETTINGS_DEFAULTS = {
     "camera_backend": "Thorlabs Scientific / Zelux", "exposure_ms": 5.0,
     "demo_diameter_um": 500.0,
+    "demo_center_x_um": round(DemoCameraBackend.default_center_um()[0], 1),
+    "demo_center_y_um": round(DemoCameraBackend.default_center_um()[1], 1),
     "grid_label_size": 50, "pixel_pitch": 3.45, "colormap": "Inferno",
     "opacity": DEFAULT_RAW_DATA_OPACITY_PERCENT, "zoom": 60,
-    "overlay_height": OVERLAY_CURVE_HEIGHT, "percent_mode": False,
+    "overlay_height": OVERLAY_CURVE_HEIGHT, "overlay_anchor": OVERLAY_ANCHOR_CENTER,
+    "overlay_hide_tails": False,
+    "percent_mode": False,
     "max_display_fps": DEFAULT_MAX_DISPLAY_FPS, "gaussian_r2_min": GAUSSIAN_R2_MIN, "averaging": 1,
     "show_integration_area": False, "calc_area_enabled": False,
     "show_grid": True, "show_gaussian_fit": True,
@@ -2102,7 +2482,11 @@ class CameraWorker(QObject):
         if backend_name == "IDS uEye / UC480":
             return UC480CameraBackend(cam_id=device_id if device_id is not None else 0)
         if backend_name == "Demo / Simulated Camera":
-            return DemoCameraBackend(diameter_um=spec.get("demo_diameter_um", 500.0))
+            return DemoCameraBackend(
+                diameter_um=spec.get("demo_diameter_um", 500.0),
+                center_x_um=spec.get("demo_center_x_um"),
+                center_y_um=spec.get("demo_center_y_um"),
+            )
         if backend_name == "Uploaded Image":
             upload = spec.get("upload_data")
             if upload is None:
@@ -2209,6 +2593,11 @@ class CameraWorker(QObject):
         if isinstance(self._camera, DemoCameraBackend):
             self._camera.set_beam_diameter_um(float(diameter_um))
 
+    @pyqtSlot(float, float)
+    def set_demo_beam_center_um(self, x_um, y_um):
+        if isinstance(self._camera, DemoCameraBackend):
+            self._camera.set_beam_center_um(float(x_um), float(y_um))
+
     @pyqtSlot(int)
     def request_dark_frame(self, count):
         if self._camera is None:
@@ -2293,12 +2682,132 @@ class CameraWorker(QObject):
             ):
                 self._schedule_next()
 
+# Width (px) of the grab zone along each panel's edges. The macOS default is
+# only ~1-2 px, so the resize cursor flickers on and off and the edge is very
+# hard to grab.
+MDI_RESIZE_BORDER_PX = 6
+SPLITTER_HANDLE_PX = 7
+
+
+class WideResizeBorderStyle(QProxyStyle):
+    """Wraps the platform style and only widens the panel (QMdiSubWindow)
+    frame, so the edges are easy to grab for resizing. Everything else is
+    drawn exactly as before."""
+
+    def pixelMetric(self, metric, option=None, widget=None):
+        if metric == QStyle.PixelMetric.PM_MdiSubWindowFrameWidth:
+            return max(MDI_RESIZE_BORDER_PX, super().pixelMetric(metric, option, widget))
+        return super().pixelMetric(metric, option, widget)
+
+    def drawPrimitive(self, element, option, painter, widget=None):
+        # Draw the panel frame ourselves in the active theme's colors: the
+        # frame is filled with the panel color (so the wide resize area is
+        # invisible) and outlined with a thin 1 px border line. The platform
+        # style (e.g. macOS) would otherwise paint it a fixed gray.
+        if element == QStyle.PrimitiveElement.PE_FrameWindow and isinstance(widget, QMdiSubWindow):
+            rect = option.rect
+            fw = self.pixelMetric(QStyle.PixelMetric.PM_MdiSubWindowFrameWidth, option, widget)
+            ring = QRegion(rect).subtracted(QRegion(rect.adjusted(fw, fw, -fw, -fw)))
+            painter.save()
+            painter.setClipRegion(ring)
+            painter.fillRect(rect, QColor(theme_color("frame_fill")))
+            painter.setClipping(False)
+            painter.setPen(QColor(theme_color("frame_line")))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(rect.adjusted(0, 0, -1, -1))
+            painter.restore()
+            return
+        super().drawPrimitive(element, option, painter, widget)
+
+
 class PersistentSubWindow(QMdiSubWindow):
 
     def __init__(self):
         super().__init__()
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
         self.toggle_action = None
+        # Panels whose contents can otherwise need scrolling (Controls,
+        # Calculations, Advanced Settings, Upload Image) grow to fit them:
+        # at launch, and the first time a hidden one is shown.
+        self.fit_on_first_show = False
+        self._auto_fitted = False
+        self._last_auto_size = None   # size the app last set (None = never)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self.fit_on_first_show and not self._auto_fitted:
+            self._auto_fitted = True
+            # After this event: the panel must be laid out before measuring.
+            QTimer.singleShot(0, lambda: self.fit_to_contents(exact=True))
+
+    def _scroll_parts(self):
+        widget = self.widget()
+        widget.ensurePolished()
+        scroll = widget.findChild(QScrollArea, options=Qt.FindChildOption.FindDirectChildrenOnly)
+        if scroll is not None and scroll.widget() is not None:
+            return scroll, scroll.widget()
+        return None, None
+
+    def content_width_needed(self):
+        """Width the panel's widget needs so nothing is cut off."""
+        scroll, content = self._scroll_parts()
+        if content is not None:
+            return (max(content.sizeHint().width(), content.minimumSizeHint().width())
+                    + 2 * scroll.frameWidth() + 2)
+        widget = self.widget()
+        return max(widget.sizeHint().width(), widget.minimumSizeHint().width())
+
+    def content_height_needed(self, widget_width):
+        """Height needed at a given widget width. Wrapped text gets taller as
+        the panel gets narrower, so this is always measured at the width the
+        panel will actually have."""
+        scroll, content = self._scroll_parts()
+        if content is not None:
+            frame = 2 * scroll.frameWidth() + 2
+            inner = max(1, widget_width - frame)
+            height = (content.heightForWidth(inner) if content.hasHeightForWidth()
+                      else content.sizeHint().height())
+            return height + frame
+        widget = self.widget()
+        return max(widget.sizeHint().height(), widget.minimumSizeHint().height())
+
+    def fit_to_contents(self, exact=False):
+        """Resize so the contents fit without scrolling.
+
+        exact=True (launch, first time a panel opens, View > Fit Panels to
+        Contents): fit exactly, shrinking or growing.
+        exact=False (automatic re-checks: theme, backend, logging): fit
+        exactly only if the panel is still at the size the app last set;
+        if you have resized it yourself, only grow (never shrink your size).
+        Width never shrinks in either mode; only the height fits exactly.
+        Always stays inside the workspace (moving left/up first)."""
+        area = self.mdiArea()
+        if area is None or self.widget() is None:
+            return
+        untouched = self._last_auto_size is not None and self.size() == self._last_auto_size
+        may_shrink = exact or untouched
+        extra_w = self.width() - self.widget().width()      # frame
+        extra_h = self.height() - self.widget().height()    # frame + title bar
+        view = area.viewport().size()
+        min_size = self.minimumSizeHint()
+
+        # Width only grows (so a panel never gets narrower than its layout);
+        # height fits exactly when allowed, so there is no empty space below.
+        need_w = self.content_width_needed() + extra_w
+        target_w = max(self.width(), need_w)
+        target_w = min(max(target_w, min_size.width()), view.width())
+
+        need_h = self.content_height_needed(target_w - extra_w) + extra_h
+        target_h = need_h if may_shrink else max(self.height(), need_h)
+        target_h = min(max(target_h, min_size.height()), view.height())
+
+        x = min(self.x(), max(0, view.width() - target_w))
+        y = min(self.y(), max(0, view.height() - target_h))
+        self.setGeometry(x, y, target_w, target_h)
+        if may_shrink:
+            # Only a size the app chose counts as "untouched"; a grow-only
+            # check on a panel you resized leaves it yours.
+            self._last_auto_size = self.size()
 
     def closeEvent(self, event):
         event.ignore()
@@ -2310,6 +2819,9 @@ class PersistentSubWindow(QMdiSubWindow):
 class CameraPanel(QWidget):
     def __init__(self):
         super().__init__()
+        # Paint the panel's own background, so the window color behind it
+        # doesn't show through as a darker frame / strips behind labels.
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         layout = QVBoxLayout(self)
 
         row1 = QHBoxLayout()
@@ -2376,13 +2888,23 @@ class CameraPanel(QWidget):
 class GraphPanel(QWidget):
     def __init__(self, y_max=SENSOR_ASSUMED_MAX_RAW * 1.05):
         super().__init__()
+        # Paint the panel's own background, so the window color behind it
+        # doesn't show through as a darker frame / strips behind labels.
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         layout = QVBoxLayout(self)
-        self.fig = Figure(figsize=(3.4, 4), dpi=100)
+        layout.setContentsMargins(2, 2, 2, 2)
+        # constrained_layout fits the title, axis labels and tick numbers
+        # inside the panel at any size (same approach as the Propagation and
+        # Stability graphs). It only runs on full redraws; per-frame blitting
+        # below is unaffected.
+        self.fig = Figure(figsize=(3.4, 2.4), dpi=100, constrained_layout=True)
         self.canvas = FigureCanvas(self.fig)
+        self.canvas.setMinimumSize(220, 150)
         self.ax = self.fig.add_subplot(111)
 
         self.ax.set_title("Live Beam Profile", fontsize=9)
         self.ax.set_xlabel("Pixel Position", fontsize=8)
+        self.ax.set_ylabel("Intensity (counts)", fontsize=8)
         self.ax.set_ylim(0, y_max)
         self.ax.tick_params(labelsize=7)
         self.ax.grid(True)
@@ -2394,7 +2916,8 @@ class GraphPanel(QWidget):
         self.e2_curve_line, = self.ax.plot([], [], 'b-', label="1/e² (13.5%)")
         self.gaussian_curve_line, = self.ax.plot([], [], 'g--', label="Ideal Gaussian")
 
-        self.ax.legend(fontsize=7)
+        self.ax.legend(fontsize=7, loc="upper right", framealpha=0.8,
+                       handlelength=1.6, borderpad=0.3, labelspacing=0.25)
         layout.addWidget(self.canvas)
 
         self.percentage_mode = False
@@ -2417,8 +2940,10 @@ class GraphPanel(QWidget):
         self.raw_max = raw_max
         if percentage:
             self.ax.set_ylim(0, 105)
+            self.ax.set_ylabel("Intensity (%)", fontsize=8)
         else:
             self.ax.set_ylim(0, raw_max * 1.05)
+            self.ax.set_ylabel("Intensity (counts)", fontsize=8)
         self.background = None
 
     def scale_values(self, values):
@@ -2427,11 +2952,12 @@ class GraphPanel(QWidget):
         return values
 
     def set_theme(self, dark):
-        face = "#2b2b2b" if dark else "white"
-        text_color = "#e0e0e0" if dark else "black"
-        grid_color = "#555555" if dark else "#b0b0b0"
+        colors = THEMES["dark" if dark else "light"]
+        face = colors["plot_face"]
+        text_color = colors["plot_text"]
+        grid_color = colors["plot_grid"]
         self.fig.patch.set_facecolor(face)
-        self.ax.set_facecolor(face)
+        self.ax.set_facecolor(colors["plot_axes"])
         for spine in self.ax.spines.values():
             spine.set_color(text_color)
         self.ax.xaxis.label.set_color(text_color)
@@ -2439,12 +2965,28 @@ class GraphPanel(QWidget):
         self.ax.title.set_color(text_color)
         self.ax.tick_params(colors=text_color)
         self.ax.grid(True, color=grid_color)
-        self.raw_data_line.set_color("white" if dark else "black")
+        raw_color = text_color
+        self.raw_data_line.set_color(raw_color)
         legend = self.ax.get_legend()
         if legend is not None:
-            legend.get_frame().set_facecolor(face)
+            legend.get_frame().set_facecolor(colors["plot_axes"])
             for text in legend.get_texts():
                 text.set_color(text_color)
+            # The legend keeps its own COPY of each line's style, so recolor
+            # the "Raw Laser Data" legend marker too (matched by label, not
+            # position). Newer matplotlib: legend_handles; older: legendHandles.
+            handles = getattr(legend, "legend_handles", None)
+            if handles is None:
+                handles = getattr(legend, "legendHandles", [])
+            raw_label = self.raw_data_line.get_label()
+            for handle, text in zip(handles, legend.get_texts()):
+                if text.get_text() == raw_label and hasattr(handle, "set_markerfacecolor"):
+                    handle.set_color(raw_color)
+                    handle.set_markerfacecolor(raw_color)
+                    handle.set_markeredgecolor(raw_color)
+                    # Full opacity in the legend so the dot reads as clearly
+                    # white/black (the data line keeps its slider opacity).
+                    handle.set_alpha(1.0)
         self.background = None
         self.canvas.draw()
 
@@ -2473,19 +3015,30 @@ class StabilityPanel(QWidget):
 
     def __init__(self, max_points=300):
         super().__init__()
+        # Paint the panel's own background, so the window color behind it
+        # doesn't show through as a darker frame / strips behind labels.
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         layout = QVBoxLayout(self)
-        self.fig = Figure(figsize=(6, 4), dpi=100)
+        layout.setContentsMargins(2, 2, 2, 2)
+        self.fig = Figure(figsize=(5, 3), dpi=100, constrained_layout=True)
         self.canvas = FigureCanvas(self.fig)
+        self.canvas.setMinimumSize(240, 170)
         self.ax = self.fig.add_subplot(111)
-        self.ax.set_title("Beam Pointing Stability")
-        self.ax.set_xlabel("Time (s)")
-        self.ax.set_ylabel("Centroid Offset from Sensor Center (µm)")
+        self.ax.set_title("Beam Pointing Stability", fontsize=10)
+        self.ax.set_xlabel("Time (s)", fontsize=9)
+        self.ax.set_ylabel("Offset from center (µm)", fontsize=9)
+        self.ax.tick_params(labelsize=8)
         self.ax.grid(True)
 
         self.x_line, = self.ax.plot([], [], 'r-', label="ΔX")
         self.y_line, = self.ax.plot([], [], 'b-', label="ΔY")
-        self.ax.legend()
+        self.ax.legend(fontsize=7, loc="upper right", framealpha=0.8)
         layout.addWidget(self.canvas)
+
+        self.statsLabel = QLabel("")
+        set_role(self.statsLabel, "stats")
+        self.statsLabel.setWordWrap(True)
+        layout.addWidget(self.statsLabel)
 
         self.max_points = max_points
         self.t_data = collections.deque(maxlen=max_points)
@@ -2509,14 +3062,22 @@ class StabilityPanel(QWidget):
             span = max(1.0, max(abs(v) for v in all_vals) * 1.2)
             self.ax.set_ylim(-span, span)
 
+        if self.x_data:
+            ppx = max(self.x_data) - min(self.x_data)
+            ppy = max(self.y_data) - min(self.y_data)
+            self.statsLabel.setText(
+                f"ΔX {self.x_data[-1]:.1f} µm · ΔY {self.y_data[-1]:.1f} µm · "
+                f"p-p X {ppx:.1f} / Y {ppy:.1f} µm")
+
         self.canvas.draw_idle()
 
     def set_theme(self, dark):
-        face = "#2b2b2b" if dark else "white"
-        text_color = "#e0e0e0" if dark else "black"
-        grid_color = "#555555" if dark else "#b0b0b0"
+        colors = THEMES["dark" if dark else "light"]
+        face = colors["plot_face"]
+        text_color = colors["plot_text"]
+        grid_color = colors["plot_grid"]
         self.fig.patch.set_facecolor(face)
-        self.ax.set_facecolor(face)
+        self.ax.set_facecolor(colors["plot_axes"])
         for spine in self.ax.spines.values():
             spine.set_color(text_color)
         self.ax.xaxis.label.set_color(text_color)
@@ -2526,7 +3087,7 @@ class StabilityPanel(QWidget):
         self.ax.grid(True, color=grid_color)
         legend = self.ax.get_legend()
         if legend is not None:
-            legend.get_frame().set_facecolor(face)
+            legend.get_frame().set_facecolor(colors["plot_axes"])
             for text in legend.get_texts():
                 text.set_color(text_color)
         self.canvas.draw()
@@ -2537,13 +3098,10 @@ class StabilityPanel(QWidget):
 # The Calculations panel uses the same look: one uniform scrollable
 # background, blue section headers, and label-left / control-right rows.
 # ---------------------------------------------------------------------------
-SECTION_HEADER_STYLE = ("color: #3a7bd5; border-bottom: 1px solid rgba(128,128,128,90);"
-                        " padding-top: 6px; padding-bottom: 2px;")
-PRIMARY_BUTTON_STYLE = ("QPushButton { background-color: #3a7bd5; color: white; border: 1px solid #5a9bf5;"
-                        " border-radius: 4px; padding: 5px; font-weight: bold; }"
-                        " QPushButton:hover { background-color: #4a8be5; }"
-                        " QPushButton:disabled { background-color: #555555; color: #999999; }")
-HINT_LABEL_STYLE = "color: gray;"
+def set_role(widget, role):
+    """Tag a widget so the theme stylesheet colors it (QLabel[role=...])."""
+    widget.setProperty("role", role)
+    return widget
 
 
 def make_scroll_layout(panel):
@@ -2569,7 +3127,7 @@ def section_header(title, point_size=12):
     font.setBold(True)
     font.setPointSize(point_size)
     header.setFont(font)
-    header.setStyleSheet(SECTION_HEADER_STYLE)
+    set_role(header, "section")
     return header
 
 
@@ -2589,6 +3147,24 @@ def shrink_combos(panel, min_chars=8):
     for combo in panel.findChildren(QComboBox):
         combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         combo.setMinimumContentsLength(min_chars)
+        fit_popup_to_items(combo)
+
+
+def fit_popup_to_items(combo):
+    """Make the OPEN list wide enough to show every item in full, even when
+    the closed box is narrow. Re-checked whenever the items change (e.g.
+    the device list after Scan)."""
+    def update(*_args):
+        view = combo.view()
+        fm = view.fontMetrics()
+        widest = max((fm.horizontalAdvance(combo.itemText(i)) for i in range(combo.count())), default=0)
+        view.setMinimumWidth(widest + 40)   # room for the check mark, padding and a scrollbar
+    model = combo.model()
+    model.rowsInserted.connect(update)
+    model.rowsRemoved.connect(update)
+    model.modelReset.connect(update)
+    model.dataChanged.connect(update)
+    update()
 
 
 def hbox_widget(*widgets, stretch_first=True):
@@ -2606,6 +3182,9 @@ class ControlPanel(QWidget):
 
     def __init__(self):
         super().__init__()
+        font = self.font()
+        font.setPointSize(12)
+        self.setFont(font)        
         layout = make_scroll_layout(self)
 
         # ---------------- Camera ----------------
@@ -2616,12 +3195,9 @@ class ControlPanel(QWidget):
         self.cameraBackendCombo.addItems(CAMERA_BACKEND_NAMES)
         camera_form.addRow(self.cameraBackendLabel, self.cameraBackendCombo)
 
-        self.deviceLabel = QLabel("Device:")
-        self.deviceCombo = QComboBox()
-        self.scanCamerasButton = QPushButton("Scan")
-        self.scanCamerasButton.setToolTip("Scan for cameras of the selected backend")
-        camera_form.addRow(self.deviceLabel, hbox_widget(self.deviceCombo, self.scanCamerasButton))
-
+        # Simulated-beam controls sit directly under the backend dropdown and
+        # are only shown when "Demo / Simulated Camera" is selected
+        # (MainWindow._update_backend_dependent_visibility).
         self.demoDiameterLabel = QLabel("Simulated 1/e\u00B2 diameter:")
         self.demoDiameterSpinBox = QDoubleSpinBox()
         self.demoDiameterSpinBox.setDecimals(1)
@@ -2634,11 +3210,70 @@ class ControlPanel(QWidget):
             "(Demo / Simulated Camera backend only). Internally the 1/e\u00B2 "
             "radius w = diameter / 2 is used in I = I0*exp(-2r\u00B2/w\u00B2)."
         )
-        camera_form.addRow(self.demoDiameterLabel, self.demoDiameterSpinBox)
+        self.demoDiameterSpinBox.setMinimumWidth(70)
+        self.demoCenterButton = QPushButton("Center Beam")
+        self.demoCenterButton.setToolTip("Move the simulated beam to the sensor center (0, 0).")
+        self.demoCenterButton.clicked.connect(self.center_demo_beam)
+        self.demoDiameterFields = hbox_widget(self.demoDiameterSpinBox, self.demoCenterButton)
+        camera_form.addRow(self.demoDiameterLabel, self.demoDiameterFields)
+
+        lim_x_um, lim_y_um = DemoCameraBackend.center_limits_um()
+        default_x_um, default_y_um = DemoCameraBackend.default_center_um()
+        position_tip = ("Beam center measured from the sensor center, matching the "
+                        "camera grid: +X is to the right, +Y is DOWNWARD. You can also "
+                        "click and drag the beam on the camera image.")
+
+        self.demoCenterXSpinBox = QDoubleSpinBox()
+        self.demoCenterXSpinBox.setDecimals(1)
+        self.demoCenterXSpinBox.setRange(-lim_x_um, lim_x_um)
+        self.demoCenterXSpinBox.setSingleStep(10.0)
+        self.demoCenterXSpinBox.setMinimumWidth(60)
+        self.demoCenterXSpinBox.setValue(round(default_x_um, 1))
+        self.demoCenterXSpinBox.setToolTip(position_tip)
+
+        self.demoCenterYSpinBox = QDoubleSpinBox()
+        self.demoCenterYSpinBox.setDecimals(1)
+        self.demoCenterYSpinBox.setRange(-lim_y_um, lim_y_um)
+        self.demoCenterYSpinBox.setSingleStep(10.0)
+        self.demoCenterYSpinBox.setMinimumWidth(60)
+        self.demoCenterYSpinBox.setValue(round(default_y_um, 1))
+        self.demoCenterYSpinBox.setToolTip(position_tip)
+
+        # One row: "Beam position:  X [   ]  Y [   ]"
+        # Unit in the label (not in each box) so both boxes fit on one row.
+        self.demoCenterLabel = QLabel("Beam position (\u00B5m):")
+        self.demoCenterLabel.setToolTip(position_tip)
+        x_tag, y_tag = QLabel("X"), QLabel("Y")
+        self.demoCenterFields = QWidget()
+        pos_row = QHBoxLayout(self.demoCenterFields)
+        pos_row.setContentsMargins(0, 0, 0, 0)
+        pos_row.setSpacing(4)
+        pos_row.addWidget(x_tag)
+        pos_row.addWidget(self.demoCenterXSpinBox, 1)
+        pos_row.addSpacing(8)
+        pos_row.addWidget(y_tag)
+        pos_row.addWidget(self.demoCenterYSpinBox, 1)
+        camera_form.addRow(self.demoCenterLabel, self.demoCenterFields)
+
+
+        # Everything that should appear only for the simulated beam.
+        self.demoWidgets = [
+            self.demoDiameterLabel, self.demoDiameterFields,
+            self.demoCenterLabel, self.demoCenterFields,
+        ]
+
+        self.deviceLabel = QLabel("Device:")
+        self.deviceCombo = QComboBox()
+        self.scanCamerasButton = QPushButton("Scan")
+        self.scanCamerasButton.setToolTip("Scan for cameras of the selected backend")
+        camera_form.addRow(self.deviceLabel, hbox_widget(self.deviceCombo, self.scanCamerasButton))
+        # The closed box can be too narrow for long camera names: show the
+        # full name on hover.
+        self.deviceCombo.currentTextChanged.connect(self.deviceCombo.setToolTip)
         layout.addLayout(camera_form)
 
         self.connectCameraButton = QPushButton("Connect Camera")
-        self.connectCameraButton.setStyleSheet(PRIMARY_BUTTON_STYLE)
+        set_role(self.connectCameraButton, "primary")
         layout.addWidget(self.connectCameraButton)
 
         # ---------------- Acquisition ----------------
@@ -2654,15 +3289,32 @@ class ControlPanel(QWidget):
         self.exposureSpinBox.setSuffix(" ms")
         self.exposureSpinBox.setValue(5.0)
         acq_form.addRow(QLabel("Exposure:"), hbox_widget(self.exposureSlider, self.exposureSpinBox))
+
+        # Averaging and dark frame: everyday steps right after setting exposure.
+        self.averagingSpinBox = QSpinBox()
+        self.averagingSpinBox.setRange(1, 20)
+        self.averagingSpinBox.setValue(1)
+        self.averagingSpinBox.setToolTip(AVERAGING_TIP)
+        avg_label = QLabel("Averaged frames:")
+        avg_label.setToolTip(AVERAGING_TIP)
+        acq_form.addRow(avg_label, self.averagingSpinBox)
+
+        self.captureDarkButton = QPushButton("Capture Dark")
+        self.captureDarkButton.setToolTip(DARK_CAPTURE_TIP)
+        self.darkEnableCheckbox = QCheckBox("Subtract")
+        self.darkEnableCheckbox.setChecked(False)
+        self.darkEnableCheckbox.setToolTip(DARK_APPLY_TIP)
+        dark_label = QLabel("Dark frame:")
+        dark_label.setToolTip(DARK_CAPTURE_TIP)
+        acq_form.addRow(dark_label, hbox_widget(self.captureDarkButton, self.darkEnableCheckbox))
         layout.addLayout(acq_form)
+
+        self.darkStatusLabel = QLabel("Dark frame: not captured")
+        set_role(self.darkStatusLabel, "hint")
+        self.darkStatusLabel.setWordWrap(True)
+        layout.addWidget(self.darkStatusLabel)
         self.exposureSlider.valueChanged.connect(self._sync_exposure_from_slider)
         self.exposureSpinBox.valueChanged.connect(self._sync_exposure_from_spinbox)
-
-        # Status line (the main window writes exposure / target display rate here).
-        self.sliderLabel = QLabel("Exposure: 5.00 ms")
-        self.sliderLabel.setStyleSheet(HINT_LABEL_STYLE)
-        self.sliderLabel.setWordWrap(True)
-        layout.addWidget(self.sliderLabel)
 
         self.captureButton = QPushButton("Capture Image")
         layout.addWidget(self.captureButton)
@@ -2672,7 +3324,8 @@ class ControlPanel(QWidget):
         display_form = make_form()
         self.cmapLabel = QLabel("Color map:")
         self.cmapCombo = QComboBox()
-        self.cmapCombo.addItems(["Inferno", "Jet", "Hot", "Magma"])
+        self.cmapCombo.addItems(list(COLORMAP_CHOICES))
+        self.cmapCombo.setToolTip("Grayscale shows intensity directly as brightness.")
         display_form.addRow(self.cmapLabel, self.cmapCombo)
 
         self.overlayHeightLabel = QLabel(f"Overlay Curve Height: {OVERLAY_CURVE_HEIGHT}px")
@@ -2680,7 +3333,22 @@ class ControlPanel(QWidget):
         self.overlayHeightSlider.setRange(10, 400)
         self.overlayHeightSlider.setValue(OVERLAY_CURVE_HEIGHT)
         display_form.addRow(self.overlayHeightLabel, self.overlayHeightSlider)
+
+        self.overlayAnchorLabel = QLabel("Profile overlay:")
+        self.overlayAnchorCombo = QComboBox()
+        self.overlayAnchorCombo.addItems([OVERLAY_ANCHOR_CENTER, OVERLAY_ANCHOR_EDGES])
+        self.overlayAnchorCombo.setToolTip(
+            "Where the X (yellow) and Y (cyan) profile curves are drawn on the camera image: "
+            "on the axes through the image center, or along the bottom and left edges of the "
+            "visible area so they never overlap.")
+        display_form.addRow(self.overlayAnchorLabel, self.overlayAnchorCombo)
         layout.addLayout(display_form)
+
+        self.hideTailsCheckbox = QCheckBox("Hide profile tails (below 0.1% of peak)")
+        self.hideTailsCheckbox.setToolTip(
+            "Draw only the bell-shaped part of the X/Y profile curves on the camera image, "
+            "instead of a flat line across the whole image. Applies when Show Gaussian Fit is on.")
+        layout.addWidget(self.hideTailsCheckbox)
 
         # Zoom: the visible control lives in the Camera panel (next to the
         # image). This slider stays as the stored value the rest of the code
@@ -2715,6 +3383,22 @@ class ControlPanel(QWidget):
         layout.addWidget(self.percentModeCheckbox)
         layout.addStretch()
         shrink_combos(self)
+
+    def center_demo_beam(self):
+        """Set both position boxes to 0 and send ONE update (not two)."""
+        self.set_demo_center_um(0.0, 0.0)
+
+    def set_demo_center_um(self, x_um, y_um):
+        """Set both position boxes at once and emit a single update, so the
+        beam never makes an intermediate jump (new X with old Y)."""
+        for box in (self.demoCenterXSpinBox, self.demoCenterYSpinBox):
+            box.blockSignals(True)
+        self.demoCenterXSpinBox.setValue(float(x_um))
+        self.demoCenterYSpinBox.setValue(float(y_um))
+        for box in (self.demoCenterXSpinBox, self.demoCenterYSpinBox):
+            box.blockSignals(False)
+        # The main window's handler reads BOTH boxes, so one emit is enough.
+        self.demoCenterYSpinBox.valueChanged.emit(self.demoCenterYSpinBox.value())
 
     def _sync_exposure_from_slider(self, value):
         self.exposureSpinBox.setValue(value / 100.0)
@@ -2764,8 +3448,7 @@ class AnalyzePanel(QWidget):
 
         def section(title):
             header = bold(QLabel(title), 12)
-            header.setStyleSheet("color: #3a7bd5; border-bottom: 1px solid rgba(128,128,128,90);"
-                                 " padding-top: 6px; padding-bottom: 2px;")
+            set_role(header, "section")
             layout.addWidget(header)
 
         def full(text):
@@ -2781,7 +3464,7 @@ class AnalyzePanel(QWidget):
         size_grid.setVerticalSpacing(4)
         for col, text in enumerate(("", "X", "Y")):
             header = bold(QLabel(text))
-            header.setStyleSheet("color: gray;")
+            set_role(header, "hint")
             size_grid.addWidget(header, 0, col)
         self.size_labels = {}
         for row, (key, name, tip) in enumerate(self.SIZE_METHODS, start=1):
@@ -2789,6 +3472,13 @@ class AnalyzePanel(QWidget):
             name_label.setToolTip(tip)
             x_label = bold(QLabel("N/A"))
             y_label = bold(QLabel("N/A"))
+            # Reserve room for the longest value this cell shows, so the
+            # panel's width (and the launch auto-fit) doesn't depend on
+            # whether a beam is being measured yet.
+            for lbl in (x_label, y_label):
+                fm = lbl.fontMetrics()
+                lbl.setMinimumWidth(max(fm.horizontalAdvance(t) for t in (
+                    "0000.0 \u00b5m  (R\u00b2 0.000)", "Not Gaussian  (R\u00b2 0.000)")))
             size_grid.addWidget(name_label, row, 0)
             size_grid.addWidget(x_label, row, 1)
             size_grid.addWidget(y_label, row, 2)
@@ -2818,18 +3508,6 @@ class AnalyzePanel(QWidget):
         self.quality_label = full("SNR: N/A")
         self.background_label = full("Background: N/A")
 
-        # ---------------- Divergence ----------------
-        section("Divergence")
-        self.treatAsWaistCheckbox = QCheckBox("Treat current plane as beam waist")
-        self.treatAsWaistCheckbox.setToolTip("Required for the divergence estimate: only valid if the camera "
-                                             "is at the beam's narrowest point (waist).")
-        self.treatAsWaistCheckbox.setChecked(False)
-        layout.addWidget(self.treatAsWaistCheckbox)
-        self.divergence_x_label = full("X Divergence: enable checkbox")
-        self.divergence_y_label = full("Y Divergence: enable checkbox")
-        for lbl in (self.divergence_x_label, self.divergence_y_label):
-            lbl.setStyleSheet("background-color: rgba(58,123,213,40); border-radius: 4px; padding: 3px;")
-
         # ---------------- Setup ----------------
         section("Setup")
         pitch_layout = QHBoxLayout()
@@ -2846,15 +3524,29 @@ class AnalyzePanel(QWidget):
 
         self.logButton = QPushButton("Start Logging")
         self.logButton.setCheckable(True)
+        self.copyLogPathButton = QPushButton("Copy Path")
+        self.copyLogPathButton.setToolTip("Copy the full path of the log file (e.g. to paste into a terminal).")
+        self.copyLogPathButton.setEnabled(False)
         layout.addWidget(self.logButton)
         self.logStatusLabel = QLabel("Logging: Off")
+        self.logStatusLabel.setWordWrap(True)
+        # Never let a long file path force the panel wider; wrap instead.
+        self.logStatusLabel.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.logStatusLabel.setMinimumWidth(0)
         layout.addWidget(self.logStatusLabel)
+        # Left-aligned under the status text, so it stays visible even when
+        # the panel is narrower than its contents (right edge clipped).
+        copy_row = QHBoxLayout()
+        copy_row.addWidget(self.copyLogPathButton)
+        copy_row.addStretch(1)
+        layout.addLayout(copy_row)
         layout.addStretch()
 
 
 class AdvancedSettingsPanel(QWidget):
-    """Advanced settings grouped as: Analysis, Dark Frame, Calculation Area,
-    Acquisition, Calibration, with Reset to Defaults at the bottom."""
+    """Advanced settings grouped as: Analysis, Calculation Area, Acquisition,
+    Calibration, with Reset to Defaults at the bottom. (Everyday acquisition
+    controls -- averaging and dark frame -- live in the Controls panel.)"""
 
     def __init__(self):
         super().__init__()
@@ -2862,10 +3554,6 @@ class AdvancedSettingsPanel(QWidget):
 
         # ---------------- Analysis ----------------
         layout.addWidget(section_header("Analysis"))
-        self.enableAdvancedMetricsCheckbox = QCheckBox("Enable D4\u03c3 / background / hot-pixel analysis")
-        self.enableAdvancedMetricsCheckbox.setChecked(True)
-        layout.addWidget(self.enableAdvancedMetricsCheckbox)
-
         analysis_form = make_form()
         self.minSnrSpinBox = QDoubleSpinBox()
         self.minSnrSpinBox.setRange(0.0, 10000.0)
@@ -2901,17 +3589,6 @@ class AdvancedSettingsPanel(QWidget):
         )
         layout.addWidget(self.showIntegrationAreaCheckbox)
 
-        # ---------------- Dark Frame ----------------
-        layout.addWidget(section_header("Dark Frame"))
-        self.captureDarkButton = QPushButton("Capture Dark (8 frames)")
-        self.darkEnableCheckbox = QCheckBox("Apply dark subtraction")
-        self.darkEnableCheckbox.setChecked(False)
-        layout.addWidget(hbox_widget(self.captureDarkButton, self.darkEnableCheckbox, stretch_first=False))
-        self.darkStatusLabel = QLabel("Dark frame: not captured")
-        self.darkStatusLabel.setStyleSheet(HINT_LABEL_STYLE)
-        self.darkStatusLabel.setWordWrap(True)
-        layout.addWidget(self.darkStatusLabel)
-
         # ---------------- Calculation Area ----------------
         layout.addWidget(section_header("Calculation Area"))
         self.calcAreaCheckbox = QCheckBox("Restrict calculation area")
@@ -2935,11 +3612,6 @@ class AdvancedSettingsPanel(QWidget):
         self.maxFpsSpinBox.setValue(DEFAULT_MAX_DISPLAY_FPS)
         self.maxFpsSpinBox.setSuffix(" FPS")
         acq_form.addRow(QLabel("Max display rate:"), self.maxFpsSpinBox)
-
-        self.averagingSpinBox = QSpinBox()
-        self.averagingSpinBox.setRange(1, 20)
-        self.averagingSpinBox.setValue(1)
-        acq_form.addRow(QLabel("Averaged frames:"), self.averagingSpinBox)
         layout.addLayout(acq_form)
 
         self.holdMaxCheckbox = QCheckBox("Hold maximum (peak hold)")
@@ -2984,10 +3656,26 @@ class PropagationPanel(QWidget):
         "Clipped", "Frames", "CV (%)"
     ]
 
+    # Short labels for the dropdown; full names are kept for tooltips and are
+    # what gets written to saved sessions (so session files don't change).
+    METHOD_LABELS = ["D4σ (ISO)", "Gaussian 1/e² (non-ISO)"]
+    METHOD_FULL_NAMES = [
+        "D4σ camera axes (2D second moment)",
+        "Gaussian-fit 1/e² diameters (non-ISO comparison)",
+    ]
+    RESULT_ROWS = ["M²", "Waist Ø", "Waist z₀", "Rayleigh zR", "Divergence (full)"]
+    CI_BUTTON_TEXT = "Compute 95% CI (bootstrap)"
+    # Columns hidden by default (on top of the inactive method's pair).
+    DEFAULT_HIDDEN_COLS = (9,)  # CV (%)
+
     def __init__(self, main_window):
         super().__init__()
+        # Paint the panel's own background, so the window color behind it
+        # doesn't show through as a darker frame / strips behind labels.
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.main_window = main_window
         self.samples = []
+        self._next_log_order = 1
         self._last_fit_x = None
         self._last_fit_y = None
         self._last_fit_inputs = {}
@@ -2995,66 +3683,65 @@ class PropagationPanel(QWidget):
         self._current_backend_name = None
         self._current_pixel_pitch_um = None
         root = QVBoxLayout(self)
+        root.setSpacing(6)
 
-        top_row = QHBoxLayout()
-        notice = QLabel(
-            "Log measurements at several Z positions, then read the coverage status, results, "
-            "and diagnostics on the right."
-        )
-        notice.setWordWrap(True)
-        top_row.addWidget(notice, 4)
-        self.detailsButton = QPushButton("ⓘ How to use / caveats")
-        self.detailsButton.clicked.connect(self._show_details_dialog)
-        top_row.addWidget(self.detailsButton, 1)
-        root.addLayout(top_row)
-
-        self.calibrationWarningLabel = QLabel("")
-        self.calibrationWarningLabel.setWordWrap(True)
-        self.calibrationWarningLabel.setStyleSheet("background:#fff3cd;color:#5f4700;padding:5px;border:1px solid #d8bd68;")
-        self.calibrationWarningLabel.setVisible(False)
-        root.addWidget(self.calibrationWarningLabel)
-
-        config = QGroupBox("Measurement configuration")
-        configLayout = QHBoxLayout(config)
-        configLayout.addWidget(QLabel("Z position:"))
+        # ---- One-line configuration row -------------------------------------
+        config_row = QHBoxLayout()
+        config_row.addWidget(QLabel("Z position:"))
         self.zSpin = QDoubleSpinBox()
         self.zSpin.setRange(-1_000_000.0, 1_000_000.0)
         self.zSpin.setDecimals(4)
         self.zSpin.setSuffix(" mm")
-        configLayout.addWidget(self.zSpin)
+        config_row.addWidget(self.zSpin)
 
-        configLayout.addWidget(QLabel("Wavelength:"))
+        config_row.addSpacing(8)
+        config_row.addWidget(QLabel("λ:"))
         self.wavelengthSpin = QDoubleSpinBox()
         self.wavelengthSpin.setRange(100.0, 3000.0)
         self.wavelengthSpin.setDecimals(2)
         self.wavelengthSpin.setSuffix(" nm")
+        self.wavelengthSpin.setToolTip("Laser wavelength used in the M² fit.")
         self.wavelengthSpin.setValue(main_window.advanced_panel.wavelengthSpinBox.value())
         self.wavelengthSpin.valueChanged.connect(self.refit)
-        configLayout.addWidget(self.wavelengthSpin)
+        config_row.addWidget(self.wavelengthSpin)
         self.wavelengthLockLabel = QLabel("")
         self.wavelengthLockLabel.setToolTip(
             "Wavelength is locked once measurements exist, so existing points are never "
             "silently reinterpreted under a different wavelength. Use Clear All to change it."
         )
-        configLayout.addWidget(self.wavelengthLockLabel)
+        config_row.addWidget(self.wavelengthLockLabel)
 
-        configLayout.addWidget(QLabel("Fit width method:"))
+        config_row.addSpacing(8)
+        config_row.addWidget(QLabel("Method:"))
         self.methodCombo = QComboBox()
-        self.methodCombo.addItems([
-            "D4σ camera axes (2D second moment)",
-            "Gaussian-fit 1/e² diameters (non-ISO comparison)",
-        ])
+        self.methodCombo.addItems(self.METHOD_LABELS)
+        for i, full_name in enumerate(self.METHOD_FULL_NAMES):
+            self.methodCombo.setItemData(i, full_name, Qt.ItemDataRole.ToolTipRole)
+        self.methodCombo.setToolTip("Width definition used for the fit.")
         self.methodCombo.currentIndexChanged.connect(self.refit)
-        configLayout.addWidget(self.methodCombo)
-        configLayout.addStretch(1)
-        root.addWidget(config)
+        config_row.addWidget(self.methodCombo)
+        config_row.addStretch(1)
 
-        advancedConfig = QGroupBox("Advanced configuration (stage convention, focal length) — click to expand")
-        advancedConfig.setCheckable(True)
-        advancedConfig.setChecked(False)
-        advancedOuter = QVBoxLayout(advancedConfig)
-        advancedContent = QWidget()
-        advancedForm = QFormLayout(advancedContent)
+        self.advancedButton = QPushButton("⚙ Advanced")
+        self.advancedButton.setToolTip("Stage convention and focusing-lens focal length (reference only).")
+        config_row.addWidget(self.advancedButton)
+        self.detailsButton = QPushButton("ⓘ Help")
+        self.detailsButton.setToolTip("How to use this panel, and caveats.")
+        self.detailsButton.clicked.connect(self._show_details_dialog)
+        config_row.addWidget(self.detailsButton)
+        root.addLayout(config_row)
+
+        self.calibrationWarningLabel = QLabel("")
+        self.calibrationWarningLabel.setWordWrap(True)
+        set_role(self.calibrationWarningLabel, "warnbox")
+        self.calibrationWarningLabel.setVisible(False)
+        root.addWidget(self.calibrationWarningLabel)
+
+        # ---- Advanced dialog (same widgets as before, just moved) -----------
+        self.advancedDialog = QDialog(self)
+        self.advancedDialog.setWindowTitle("Advanced configuration")
+        adv_layout = QVBoxLayout(self.advancedDialog)
+        advancedForm = QFormLayout()
         self.directionCombo = QComboBox()
         self.directionCombo.addItems(["Increasing Z is downstream", "Increasing Z is upstream"])
         advancedForm.addRow("Stage convention (label only — does not change the fit):", self.directionCombo)
@@ -3065,13 +3752,20 @@ class PropagationPanel(QWidget):
         self.lensEdit.setSpecialValueText("Not recorded")
         advancedForm.addRow("Focusing-lens focal length (reference only — M² is invariant\n"
                              "through ideal optics, so this is not applied to the fit):", self.lensEdit)
-        advancedOuter.addWidget(advancedContent)
-        advancedContent.setVisible(False)
-        advancedConfig.toggled.connect(advancedContent.setVisible)
-        root.addWidget(advancedConfig)
+        adv_layout.addLayout(advancedForm)
+        adv_buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        adv_buttons.rejected.connect(self.advancedDialog.reject)
+        adv_layout.addWidget(adv_buttons)
+        self.advancedButton.clicked.connect(self.advancedDialog.exec)
 
-        body = QHBoxLayout()
-        left = QVBoxLayout()
+        # ---- Body: draggable split between the table and the results --------
+        body = QSplitter(Qt.Orientation.Horizontal)
+        body.setChildrenCollapsible(False)
+        body.setHandleWidth(SPLITTER_HANDLE_PX)  # wider, easier-to-grab divider
+
+        left_widget = QWidget()
+        left = QVBoxLayout(left_widget)
+        left.setContentsMargins(0, 0, 0, 0)
         button_row = QHBoxLayout()
         self.logButton = QPushButton("Log Stable Current Measurement")
         self.logButton.clicked.connect(self.log_current)
@@ -3091,90 +3785,138 @@ class PropagationPanel(QWidget):
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.itemChanged.connect(self._table_changed)
         self.table.setToolTip(
-            "Rows sharing a highlighted tint were logged at (approximately) the same Z and are "
-            "aggregated into one plane for fitting. The currently inactive width method's "
-            "columns are shown in italics."
+            "Tinted rows are replicate measurements at the same Z; they are averaged into "
+            "one plane for fitting. Right-click the column headers to show or hide columns."
         )
-        left.addWidget(self.table)
+        self._user_col_visibility = {}
+        header = self.table.horizontalHeader()
+        header.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        header.customContextMenuRequested.connect(self._show_column_menu)
+        left.addWidget(self.table, 1)
 
-        export_row = QHBoxLayout()
-        self.saveSessionButton = QPushButton("Save Session JSON")
-        self.loadSessionButton = QPushButton("Load Session JSON")
-        self.exportCsvButton = QPushButton("Export Raw CSV")
-        self.exportAggregatedCsvButton = QPushButton("Export Aggregated CSV")
-        self.saveSessionButton.clicked.connect(self.save_session)
-        self.loadSessionButton.clicked.connect(self.load_session)
-        self.exportCsvButton.clicked.connect(self.export_csv)
-        self.exportAggregatedCsvButton.clicked.connect(self.export_aggregated_csv)
-        export_row.addWidget(self.saveSessionButton)
-        export_row.addWidget(self.loadSessionButton)
-        export_row.addWidget(self.exportCsvButton)
-        export_row.addWidget(self.exportAggregatedCsvButton)
-        left.addLayout(export_row)
+        file_row = QHBoxLayout()
+        self.fileButton = QToolButton()
+        self.fileButton.setText("File ▾")
+        self.fileButton.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        # The themes style every QToolButton, which makes Qt add a large default
+        # menu arrow on top of "File ▾". Hide it for this button only (this
+        # per-button rule builds on the app theme instead of replacing it).
+        self.fileButton.setStyleSheet("QToolButton::menu-indicator { image: none; width: 0px; }")
+        file_menu = QMenu(self.fileButton)
+        file_menu.addAction("Save Session JSON", self.save_session)
+        file_menu.addAction("Load Session JSON", self.load_session)
+        file_menu.addSeparator()
+        file_menu.addAction("Export Raw CSV", self.export_csv)
+        file_menu.addAction("Export Aggregated CSV", self.export_aggregated_csv)
+        self.fileButton.setMenu(file_menu)
+        file_row.addWidget(self.fileButton)
+        file_row.addStretch(1)
+        left.addLayout(file_row)
+        body.addWidget(left_widget)
 
-        analysis_row = QHBoxLayout()
-        self.finalizeButton = QPushButton("Finalize Analysis (bootstrap 95% CI)")
+        # Right side: graph on top, results below, with a draggable divider.
+        right_split = QSplitter(Qt.Orientation.Vertical)
+        right_split.setChildrenCollapsible(False)
+        right_split.setHandleWidth(SPLITTER_HANDLE_PX)
+
+        self.figure = Figure(figsize=(5, 3), constrained_layout=True)
+        self.main_canvas = FigureCanvas(self.figure)
+        self.main_canvas.setMinimumHeight(220)
+        self.ax = self.figure.add_subplot(111)
+        right_split.addWidget(self.main_canvas)
+
+        results_scroll = QScrollArea()
+        results_scroll.setWidgetResizable(True)
+        results_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        results_widget = QWidget()
+        results = QVBoxLayout(results_widget)
+        results.setContentsMargins(0, 4, 0, 0)
+
+        self.statusLabel = QLabel(self._status_html(None, None, 0))
+        self.statusLabel.setWordWrap(True)
+        results.addWidget(self.statusLabel)
+
+        self.resultsTable = QTableWidget(len(self.RESULT_ROWS), 2)
+        self.resultsTable.setHorizontalHeaderLabels(["X", "Y"])
+        self.resultsTable.setVerticalHeaderLabels(self.RESULT_ROWS)
+        self.resultsTable.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.resultsTable.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.resultsTable.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.resultsTable.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.resultsTable.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.resultsTable.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.resultsTable.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._fill_results_table(None, None)
+        results.addWidget(self.resultsTable)
+
+        self.finalizeButton = QPushButton(self.CI_BUTTON_TEXT)
         self.finalizeButton.setToolTip(
             "Runs an on-demand parametric bootstrap for a more robust confidence interval than "
-            "the live linearized ±. Not run automatically on every edit -- only when requested."
+            "the live linearized ±. Not run automatically on every edit -- only when requested. "
+            "The interval appears next to M² in the table."
         )
         self.finalizeButton.clicked.connect(self.finalize_analysis)
-        analysis_row.addWidget(self.finalizeButton)
-        left.addLayout(analysis_row)
-        body.addLayout(left, 3)
+        self.diagnosticsButton = QPushButton("Fit Diagnostics…")
+        self.diagnosticsButton.setToolTip(
+            "Residual plot, coverage and fit checks per axis, parameter correlations, "
+            "and the full uncertainty notes (opens in its own window).")
+        results.addWidget(hbox_widget(self.finalizeButton, self.diagnosticsButton))
 
-        right = QVBoxLayout()
-        self.statusLabel = QLabel(self._overall_status_html(None, None))
-        self.statusLabel.setWordWrap(True)
-        right.addWidget(self.statusLabel)
-
-        self.figure = Figure(figsize=(7, 6), tight_layout=True)
-        self.main_canvas = FigureCanvas(self.figure)
-        gs = self.figure.add_gridspec(2, 1, height_ratios=[3, 1])
-        self.ax = self.figure.add_subplot(gs[0])
-        self.zone_ax = self.figure.add_subplot(gs[1])
-        right.addWidget(self.main_canvas, 6)
-
-        cards_row = QHBoxLayout()
-        self.xCard = QLabel("")
-        self.yCard = QLabel("")
-        for card in (self.xCard, self.yCard):
-            card.setWordWrap(True)
-            card.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            card.setStyleSheet("border:1px solid #7fa0c0;border-radius:6px;padding:8px;")
-            card.setAlignment(Qt.AlignmentFlag.AlignTop)
-        cards_row.addWidget(self.xCard)
-        cards_row.addWidget(self.yCard)
-        right.addLayout(cards_row, 3)
-
-        self.diagnosticsGroup = QGroupBox("Fit Diagnostics (residuals, correlation, boundary checks) — click to expand")
-        self.diagnosticsGroup.setCheckable(True)
-        self.diagnosticsGroup.setChecked(False)
-        diagOuter = QVBoxLayout(self.diagnosticsGroup)
-        self.diagnosticsContent = QWidget()
-        diagContentLayout = QVBoxLayout(self.diagnosticsContent)
-        self.diag_figure = Figure(figsize=(6, 2.5), tight_layout=True)
+        # Diagnostics live in their own non-modal window, so opening them can
+        # never squeeze the graph or the results table.
+        self.diagnosticsDialog = QDialog(self)
+        self.diagnosticsDialog.setWindowTitle("Propagation fit diagnostics")
+        self.diagnosticsDialog.setModal(False)
+        self.diagnosticsDialog.resize(640, 560)
+        diag_layout = QVBoxLayout(self.diagnosticsDialog)
+        self.diag_figure = Figure(figsize=(5, 2.2), constrained_layout=True)
         self.diag_canvas = FigureCanvas(self.diag_figure)
+        self.diag_canvas.setMinimumHeight(200)
         self.resid_ax = self.diag_figure.add_subplot(111)
-        diagContentLayout.addWidget(self.diag_canvas)
+        diag_layout.addWidget(self.diag_canvas, 1)
+        diag_scroll = QScrollArea()
+        diag_scroll.setWidgetResizable(True)
         self.diagnosticsLabel = QLabel("")
         self.diagnosticsLabel.setWordWrap(True)
+        self.diagnosticsLabel.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         self.diagnosticsLabel.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        diagContentLayout.addWidget(self.diagnosticsLabel)
-        diagOuter.addWidget(self.diagnosticsContent)
-        self.diagnosticsContent.setVisible(False)
-        self.diagnosticsGroup.toggled.connect(self.diagnosticsContent.setVisible)
-        right.addWidget(self.diagnosticsGroup, 3)
+        self.diagnosticsLabel.setContentsMargins(6, 6, 6, 6)
+        diag_scroll.setWidget(self.diagnosticsLabel)
+        diag_layout.addWidget(diag_scroll, 1)
+        diag_close = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        diag_close.rejected.connect(self.diagnosticsDialog.hide)
+        diag_layout.addWidget(diag_close)
+        self.diagnosticsButton.clicked.connect(self._show_diagnostics)
+        results.addStretch(1)
 
-        body.addLayout(right, 4)
-        root.addLayout(body)
+        results_scroll.setWidget(results_widget)
+        right_split.addWidget(results_scroll)
+        right_split.setStretchFactor(0, 1)
+        right_split.setStretchFactor(1, 0)
+        right_split.setSizes([300, 260])
+        body.addWidget(right_split)
+        body.setStretchFactor(0, 3)
+        body.setStretchFactor(1, 4)
+        body.setSizes([480, 640])
+        root.addWidget(body, 1)
+
         self._sync_wavelength_lock()
+        self._apply_column_visibility()
+        self.refit()
+
+    def _show_diagnostics(self):
+        self.diagnosticsDialog.show()
+        self.diagnosticsDialog.raise_()
+        self.diagnosticsDialog.activateWindow()
+        self.diag_canvas.draw_idle()
 
     # -- details / scope dialog -------------------------------------------------
 
     def _show_details_dialog(self):
         QMessageBox.information(
             self, "How to use this / caveats",
+            "Log measurements at several Z positions, then read the status line and results "
+            "table on the right. “Fit Diagnostics…” shows residuals and the full checks.<br><br>"
             "<b>How to use this:</b> 1) Move the camera (or the beam/focusing lens) to a new "
             "Z position along the beam path and enter that position above. 2) Wait for a "
             "steady, unsaturated beam. 3) Click “Log Stable Current Measurement” -- it "
@@ -3205,7 +3947,7 @@ class PropagationPanel(QWidget):
     def _sync_wavelength_lock(self):
         locked = len(self.samples) > 0
         self.wavelengthSpin.setEnabled(not locked)
-        self.wavelengthLockLabel.setText("\U0001f512 locked (Clear All to change)" if locked else "")
+        self.wavelengthLockLabel.setText("\U0001f512" if locked else "")
 
     # -- logging / table ----------------------------------------------------
 
@@ -3245,8 +3987,52 @@ class PropagationPanel(QWidget):
                 "(Clear All)."
             )
             self.calibrationWarningLabel.setVisible(True)
+        sample.log_order = self._next_log_order
+        self._next_log_order += 1
         self.samples.append(sample)
-        self._append_row(sample)
+        self._rebuild_table(select_ids={sample.sample_id})  # sorts, then selects + scrolls to the new point
+        self.refit()
+
+    # -- Z-sorted table -------------------------------------------------------
+    # self.samples and the table rows are matched BY ROW NUMBER (Use
+    # checkboxes, Z edits, Delete Selected and the fit all rely on it), so
+    # sorting always reorders self.samples first and then rebuilds the table
+    # from it. Qt's built-in click-to-sort is deliberately NOT used: it would
+    # reorder only the view and break that matching.
+
+    def _sort_key(self, sample):
+        # By Z; points without a Z go last; replicates keep their logging order.
+        z = sample.z_mm
+        return (z is None, z if z is not None else 0.0, sample.log_order or 0)
+
+    def _rebuild_table(self, select_ids=None):
+        """Sort self.samples by Z and rebuild the table to match, row for row.
+        `select_ids`: sample_ids to select afterwards (defaults to the current
+        selection, so a re-sort doesn't lose what the user selected)."""
+        if select_ids is None:
+            select_ids = {self.samples[i.row()].sample_id
+                          for i in self.table.selectionModel().selectedRows()
+                          if 0 <= i.row() < len(self.samples)}
+        self.samples.sort(key=self._sort_key)
+        self.table.blockSignals(True)
+        self.table.setRowCount(0)
+        self.table.blockSignals(False)
+        for sample in self.samples:
+            self._append_row(sample)
+        self.table.clearSelection()
+        first_row = None
+        for row, sample in enumerate(self.samples):
+            if sample.sample_id in select_ids:
+                self.table.selectionModel().select(
+                    self.table.model().index(row, 0),
+                    QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
+                if first_row is None:
+                    first_row = row
+        if first_row is not None:
+            self.table.scrollToItem(self.table.item(first_row, 1))
+
+    def _resort_after_edit(self):
+        self._rebuild_table()
         self.refit()
 
     def _append_row(self, sample):
@@ -3275,6 +4061,9 @@ class PropagationPanel(QWidget):
             if col != 1:
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.table.setItem(row, col, item)
+        header_item = QTableWidgetItem(str(sample.log_order) if sample.log_order else "")
+        header_item.setToolTip("Logging order (the table itself is sorted by Z)")
+        self.table.setVerticalHeaderItem(row, header_item)
         self.table.blockSignals(False)
 
     def _table_changed(self, item):
@@ -3287,7 +4076,11 @@ class PropagationPanel(QWidget):
             try:
                 self.samples[row].z_mm = float(item.text())
             except ValueError:
-                pass
+                pass  # the rebuild below restores the old value in the cell
+            # Re-sort AFTER Qt finishes processing this edit (rebuilding the
+            # table inside its own itemChanged signal is unsafe). Includes refit().
+            QTimer.singleShot(0, self._resort_after_edit)
+            return
         self.refit()
 
     def delete_selected(self):
@@ -3304,6 +4097,7 @@ class PropagationPanel(QWidget):
         ) != QMessageBox.StandardButton.Yes:
             return
         self.samples.clear()
+        self._next_log_order = 1
         self.table.setRowCount(0)
         self.calibrationWarningLabel.setVisible(False)
         self._bootstrap_results = {}
@@ -3331,6 +4125,17 @@ class PropagationPanel(QWidget):
         return rows, points
 
     def _recolor_table(self):
+        # Styling changes (fonts, backgrounds) emit itemChanged. Without
+        # blocking, each one re-entered _table_changed: a full refit per styled
+        # cell, and a Z-cell background change would schedule another Z re-sort
+        # (which rebuilds the rows and restyles them again, looping forever).
+        was_blocked = self.table.blockSignals(True)
+        try:
+            self._recolor_table_impl()
+        finally:
+            self.table.blockSignals(was_blocked)
+
+    def _recolor_table_impl(self):
         use_d4 = self.methodCombo.currentIndex() == 0
         active_cols = (2, 3) if use_d4 else (4, 5)
         inactive_cols = (4, 5) if use_d4 else (2, 3)
@@ -3363,91 +4168,169 @@ class PropagationPanel(QWidget):
                 group_id += 1
             group_of[i] = group_id
             prev_z = z
+        group_size = collections.Counter(group_of.values())
         for row in range(len(self.samples)):
             gid = group_of.get(row)
             item = self.table.item(row, 0)
-            if item is None or gid is None:
+            if item is None:
                 continue
-            item.setBackground(QColor(120, 170, 220, 35) if gid % 2 == 0 else QColor(0, 0, 0, 0))
+            # Tint ONLY true replicates (2+ rows at the same Z), alternating
+            # the shade between replicate groups so adjacent groups differ.
+            if gid is not None and group_size[gid] >= 2:
+                item.setBackground(QColor(120, 170, 220, 70) if gid % 2 == 0 else QColor(220, 170, 90, 70))
+            else:
+                item.setBackground(QColor(0, 0, 0, 0))
+        self._apply_column_visibility()
+
+    def _default_hidden_columns(self):
+        use_d4 = self.methodCombo.currentIndex() == 0
+        inactive = (4, 5) if use_d4 else (2, 3)
+        return set(inactive) | set(self.DEFAULT_HIDDEN_COLS)
+
+    def _apply_column_visibility(self):
+        hidden = self._default_hidden_columns()
+        for col in range(self.table.columnCount()):
+            visible = self._user_col_visibility.get(col, col not in hidden)
+            self.table.setColumnHidden(col, not visible)
+
+    def _show_column_menu(self, pos):
+        menu = QMenu(self)
+        for col in range(1, self.table.columnCount()):  # "Use" always stays visible
+            action = menu.addAction(self.HEADERS[col])
+            action.setCheckable(True)
+            action.setChecked(not self.table.isColumnHidden(col))
+            action.toggled.connect(lambda checked, c=col: self._set_user_column_visible(c, checked))
+        menu.addSeparator()
+        menu.addAction("Reset to default columns", self._reset_user_columns)
+        menu.exec(self.table.horizontalHeader().mapToGlobal(pos))
+
+    def _set_user_column_visible(self, col, visible):
+        self._user_col_visibility[col] = bool(visible)
+        self._apply_column_visibility()
+
+    def _reset_user_columns(self):
+        self._user_col_visibility = {}
+        self._apply_column_visibility()
 
     # -- coverage bar ---------------------------------------------------------
 
-    def _draw_zone_bar(self, ax, fit, y_pos, z_all):
-        if fit is None or fit.get("zones") is None:
+    def _shade_zones(self, fit_x, fit_y, z_all):
+        """Shade near-waist (green) and far-field (red) regions behind the
+        data, so it is visible where more planes are needed. Uses the X fit
+        (or Y if X failed). Also widens the x-axis so the far-field target is
+        on screen when that is reasonable."""
+        ax = self.ax
+        fit = fit_x if fit_x is not None else fit_y
+        self.main_canvas.setToolTip("")
+        if fit is None or fit["z_r_mm"] <= 0 or z_all.size == 0:
             return
-        z0, zr = fit["z0_mm"], fit["z_r_mm"]
-        if zr <= 0:
-            return
-        zmin, zmax = float(np.min(z_all)), float(np.max(z_all))
-        lo = min(zmin, z0 - 2.5 * zr)
-        hi = max(zmax, z0 + 2.5 * zr)
-        bands = [
-            (lo, z0 - 2 * zr, "tab:red"),
-            (z0 - 2 * zr, z0 - zr, "gold"),
-            (z0 - zr, z0 + zr, "tab:green"),
-            (z0 + zr, z0 + 2 * zr, "gold"),
-            (z0 + 2 * zr, hi, "tab:red"),
-        ]
-        for start, end, color in bands:
-            if end > start:
-                ax.broken_barh([(start, end - start)], (y_pos - 0.35, 0.7), facecolors=color, alpha=0.30)
-        ax.scatter(z_all, np.full_like(z_all, y_pos, dtype=float), marker="|", color="black", s=200, zorder=5)
+        z0, zr = float(fit["z0_mm"]), float(fit["z_r_mm"])
+        dmin, dmax = float(np.min(z_all)), float(np.max(z_all))
+        span = max(dmax - dmin, 1e-9)
+        pad = 0.05 * span
+        lo = min(dmin - pad, z0 - 2.2 * zr)
+        hi = max(dmax + pad, z0 + 2.2 * zr)
+        # Never let the shading squash the data: cap the view at 3x the data
+        # span, centered on the data.
+        max_width = 3.0 * span
+        if hi - lo > max_width:
+            center = 0.5 * (dmin + dmax)
+            lo = max(lo, center - max_width / 2.0)
+            hi = min(hi, center + max_width / 2.0)
+            lo = min(lo, dmin - pad)
+            hi = max(hi, dmax + pad)
+        ax.set_xlim(lo, hi)
+        ax.axvspan(z0 - zr, z0 + zr, color="tab:green", alpha=0.10, zorder=0, lw=0)
+        if z0 - 2 * zr > lo:
+            ax.axvspan(lo, z0 - 2 * zr, color="tab:red", alpha=0.08, zorder=0, lw=0)
+        if z0 + 2 * zr < hi:
+            ax.axvspan(z0 + 2 * zr, hi, color="tab:red", alpha=0.08, zorder=0, lw=0)
+        ax.axvline(z0, ls=":", lw=1, color="gray", zorder=1)
+        # Far-field boundary off screen: say where it is.
+        if z0 - 2 * zr < lo:
+            ax.text(0.01, 0.02, f"◂ far field ≤ {z0 - 2 * zr:.0f} mm", transform=ax.transAxes,
+                    ha="left", va="bottom", fontsize=7, color="gray")
+        if z0 + 2 * zr > hi:
+            ax.text(0.99, 0.02, f"far field ≥ {z0 + 2 * zr:.0f} mm ▸", transform=ax.transAxes,
+                    ha="right", va="bottom", fontsize=7, color="gray")
+        tip = ("Green = near-waist (within 1 Rayleigh range), red = far field "
+               "(beyond 2 Rayleigh ranges), dotted line = fitted waist z₀. "
+               f"Zones use the {'X' if fit is fit_x else 'Y'} fit.")
+        if fit_x is not None and fit_y is not None:
+            differ = (abs(fit_x["z0_mm"] - fit_y["z0_mm"]) > 0.1 * fit_x["z_r_mm"]
+                      or abs(fit_x["z_r_mm"] / max(fit_y["z_r_mm"], 1e-12) - 1.0) > 0.1)
+            if differ:
+                tip += " X and Y differ by more than 10% -- see Diagnostics for Y."
+        self.main_canvas.setToolTip(tip)
 
     # -- status / card text ---------------------------------------------------
 
-    def _overall_status_html(self, fit_x, fit_y):
-        fits = [f for f in (fit_x, fit_y) if f is not None]
-        if not fits:
-            return ('<span style="color:#b36b00;"><b>⚠ Add at least four distinct Z planes '
-                    '(after replicate aggregation) for a provisional fit.</b></span>')
-        all_ok = all(
-            f["model_constraints_satisfied"]
-            and coverage_summary(f["zones"], f["unique_planes"])["iso_style_target_met"]
-            and describe_identifiability(f).startswith("Parameters appear")
-            for f in fits
-        )
-        if all_ok:
-            return '<span style="color:#2e7d32;"><b>✓ Coverage target met; fit checks passed on both axes.</b></span>'
-        return '<span style="color:#b36b00;"><b>⚠ Provisional — see per-axis details below for what is missing.</b></span>'
+    def _status_html(self, fit_x, fit_y, n_planes):
+        non_iso = self.methodCombo.currentIndex() != 0 if hasattr(self, "methodCombo") else False
+        suffix = " (non-ISO comparison)" if non_iso else ""
+        if fit_x is None and fit_y is None:
+            return (f'<span style="color:{theme_color("prop_warn")};"><b>⚠ '
+                    f'{n_planes} of 4 planes logged — need ≥ 4 Z positions for a fit.{suffix}</b></span>')
+        cx, cy = fit_checks(fit_x), fit_checks(fit_y)
+        if cx["ok"] and cy["ok"]:
+            return (f'<span style="color:{theme_color("prop_ok")};"><b>✓ Coverage target met; fit checks passed '
+                    f'(X and Y).{suffix}</b></span>')
+        first_x = cx["issues"][0] if cx["issues"] else None
+        first_y = cy["issues"][0] if cy["issues"] else None
+        if first_x == first_y:
+            reason = first_x
+        else:
+            parts = []
+            if first_x:
+                parts.append(f"X: {first_x}")
+            if first_y:
+                parts.append(f"Y: {first_y}")
+            reason = " · ".join(parts)
+        # Issue text can contain "<" (e.g. "M² < 1"), so escape it for the rich-text label.
+        return f'<span style="color:{theme_color("prop_warn")};"><b>⚠ Provisional: {html.escape(reason)}.{suffix}</b></span>'
 
-    def _card_html(self, name, fit):
-        if fit is None:
-            return f"<b>{name}</b>: fit failed or insufficient independent data."
-        use_d4 = self.methodCombo.currentIndex() == 0
-        mode_header = (f"<b>{name} — D4σ / M² propagation analysis</b>" if use_d4 else
-                       f'<b><span style="color:#8a5300;">{name} — Gaussian-derived M² estimate '
-                       f'(non-ISO comparison)</span></b>')
-        summary = coverage_summary(fit["zones"], fit["unique_planes"])
-        ident_text = describe_identifiability(fit)
-        cov_text = describe_coverage(summary)
-        status_ok = (fit["model_constraints_satisfied"] and summary["iso_style_target_met"]
-                     and ident_text.startswith("Parameters appear"))
-        status_html = ('<span style="color:#2e7d32;">✓ Fit checks passed</span>' if status_ok else
-                       '<span style="color:#b36b00;">⚠ Provisional</span>')
-        weighted_note = (" (weighted by replicate/frame repeatability -- relative weighting only, "
-                          "not a calibrated absolute uncertainty)" if fit["weighted"] else " (unweighted)")
-        lines = [
-            mode_header,
-            status_html,
-            f"M² = {fit['m2']:.3f} ± {fit['m2_error']:.3f}{weighted_note}",
-            f"Waist diameter = {2 * fit['w0_um'] / 1000:.4f} mm  (w₀ = {fit['w0_um']:.1f} µm)",
-            f"Waist position z₀ = {fit['z0_mm']:.4g} ± {fit['z0_error_mm']:.3g} mm",
-            f"Full divergence = {fit['theta_full_mrad']:.4g} mrad (half = {fit['theta_half_mrad']:.4g} mrad)",
-            f"zR = {fit['z_r_mm']:.4g} mm",
-            cov_text,
-            ident_text,
-            f"Fit constraints satisfied: {fit['model_constraints_satisfied']}",
-        ]
-        boot = self._bootstrap_results.get(name)
-        if boot and boot.get("n_successful", 0) > 0:
-            m2_lo, m2_hi = boot["m2_ci95"]
-            lines.append(
-                f"Bootstrap 95% CI (n={boot['n_successful']}/{boot['n_requested']}, parametric): "
-                f"M² ∈ [{m2_lo:.2f}, {m2_hi:.2f}]"
-            )
-        elif boot is not None:
-            lines.append("Bootstrap CI: did not converge on enough resamples.")
-        return "<br>".join(lines)
+    def _set_result_cell(self, row, col, text, tooltip=""):
+        item = QTableWidgetItem(text)
+        item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        if tooltip:
+            item.setToolTip(tooltip)
+        self.resultsTable.setItem(row, col, item)
+
+    def _fill_results_table(self, fit_x, fit_y):
+        use_d4 = self.methodCombo.currentIndex() == 0 if hasattr(self, "methodCombo") else True
+        tag = "" if use_d4 else " (Gaussian)"
+        self.resultsTable.setHorizontalHeaderLabels([f"X{tag}", f"Y{tag}"])
+        for col, (name, fit) in enumerate((("X", fit_x), ("Y", fit_y))):
+            if fit is None:
+                for row in range(len(self.RESULT_ROWS)):
+                    self._set_result_cell(row, col, "—")
+                continue
+            m2_text = f"{fit['m2']:.2f}"
+            if fit.get("m2_near_ideal"):
+                m2_text += "  ≈ ideal"
+            boot = self._bootstrap_results.get(name)
+            m2_tip = f"± {fit['m2_error']:.3f} (relative fit uncertainty, not calibrated)"
+            if boot and boot.get("n_successful", 0) > 0:
+                lo, hi = boot["m2_ci95"]
+                m2_text += f"  [{lo:.2f}–{hi:.2f}]"
+                m2_tip += (f"\nBootstrap 95% CI (n={boot['n_successful']}/{boot['n_requested']}, "
+                           f"parametric): [{lo:.3f}, {hi:.3f}]")
+            elif boot is not None:
+                m2_tip += "\nBootstrap CI did not converge on enough resamples."
+            self._set_result_cell(0, col, m2_text, m2_tip)
+            waist_d_um = 2.0 * fit["w0_um"]
+            waist_text = f"{waist_d_um:.1f} µm" if waist_d_um < 1000 else f"{waist_d_um / 1000:.3f} mm"
+            self._set_result_cell(1, col, waist_text, f"w₀ = {fit['w0_um']:.1f} µm (1/e² radius)")
+            self._set_result_cell(2, col, f"{fit['z0_mm']:.1f} mm", f"± {fit['z0_error_mm']:.3g} mm")
+            self._set_result_cell(3, col, f"{fit['z_r_mm']:.3g} mm")
+            self._set_result_cell(4, col, f"{fit['theta_full_mrad']:.3g} mrad",
+                                  f"half-angle {fit['theta_half_mrad']:.3g} mrad")
+        # Fixed height that shows every row with no inner scroll bar.
+        self.resultsTable.resizeRowsToContents()
+        height = self.resultsTable.horizontalHeader().sizeHint().height() + 4
+        for row in range(self.resultsTable.rowCount()):
+            height += self.resultsTable.rowHeight(row)
+        self.resultsTable.setFixedHeight(height)
 
     def _diagnostics_html(self, name, fit):
         if fit is None:
@@ -3464,45 +4347,86 @@ class PropagationPanel(QWidget):
                 f"NRMSE={100*fit['nrmse']:.3g}% (descriptive only -- not a validity signal)"
                 f"{weighted_rmse_text}<br>Parameter correlation: {corr_text}<br>Boundary hits: {bounds_text}")
 
-    def _render_results(self):
-        self.statusLabel.setText(self._overall_status_html(self._last_fit_x, self._last_fit_y))
-        self.xCard.setText(self._card_html("X", self._last_fit_x))
-        self.yCard.setText(self._card_html("Y", self._last_fit_y))
-        diag_lines = [self._diagnostics_html("X", self._last_fit_x), self._diagnostics_html("Y", self._last_fit_y)]
+    def _render_results(self, n_planes=0):
+        self._last_n_planes = n_planes
+        self.statusLabel.setText(self._status_html(self._last_fit_x, self._last_fit_y, n_planes))
+        self._fill_results_table(self._last_fit_x, self._last_fit_y)
+        diag_lines = []
+        for name, fit in (("X", self._last_fit_x), ("Y", self._last_fit_y)):
+            checks = fit_checks(fit)
+            block = [f"<b>{name} checks</b>"]
+            block += [html.escape(t) for t in (checks["details"] if checks["details"] else checks["issues"])]
+            diag_lines.append("<br>".join(block))
+            if fit is not None:
+                diag_lines.append(self._diagnostics_html(name, fit))
         diag_lines.append(f"<i>{PROPAGATION_SCOPE_NOTE}</i>")
         self.diagnosticsLabel.setText("<br><br>".join(diag_lines))
 
     # -- fitting --------------------------------------------------------------
+
+    def _style_axes(self):
+        # Called after every ax.clear() (which resets colors to matplotlib's
+        # white defaults), so the graphs always follow the active theme.
+        face, text_color = theme_color("prop_face"), theme_color("prop_text")
+        grid_color = theme_color("prop_grid")
+        for fig in (self.figure, self.diag_figure):
+            fig.patch.set_facecolor(face)
+        for ax in (self.ax, self.resid_ax):
+            ax.set_facecolor(theme_color("prop_axes"))
+            ax.tick_params(labelsize=8, colors=text_color)
+            for spine in ax.spines.values():
+                spine.set_color(text_color)
+            ax.grid(True, alpha=0.25, color=grid_color)
+        self.ax.set_xlabel("Z (mm)", fontsize=9, color=text_color)
+        self.ax.set_ylabel("Diameter (µm)", fontsize=9, color=text_color)
+        self.resid_ax.set_xlabel("Z (mm)", fontsize=9, color=text_color)
+        self.resid_ax.set_ylabel("Radius residual (µm)", fontsize=9, color=text_color)
+
+    def set_theme(self, dark):
+        """Recolor the graphs and status line for the new theme without
+        refitting (a refit would clear a computed confidence interval)."""
+        self._style_axes()
+        legend = self.ax.get_legend()
+        if legend is not None:
+            for text in legend.get_texts():
+                text.set_color(theme_color("prop_text"))
+        self.statusLabel.setText(self._status_html(self._last_fit_x, self._last_fit_y,
+                                                   getattr(self, "_last_n_planes", 0)))
+        self.main_canvas.draw_idle()
+        self.diag_canvas.draw_idle()
+
+    def _legend(self):
+        handles, labels = self.ax.get_legend_handles_labels()
+        if handles:
+            self.ax.legend(fontsize=7, ncol=4, loc="lower center", bbox_to_anchor=(0.5, 1.0),
+                           frameon=False, borderaxespad=0.2, handletextpad=0.4, columnspacing=1.2)
+            for text in self.ax.get_legend().get_texts():
+                text.set_color(theme_color("prop_text"))
 
     def refit(self, *args):
         self._recolor_table()
         self._sync_wavelength_lock()
         rows, points = self._selected_data()
         self.ax.clear()
-        self.zone_ax.clear()
         self.resid_ax.clear()
-        self.ax.set_ylabel("Full beam diameter (µm)")
-        self.zone_ax.set_xlabel("Z position (mm)")
-        self.resid_ax.set_xlabel("Z position (mm)")
-        self.resid_ax.set_ylabel("Radius residual (µm)")
+        self.main_canvas.setToolTip("")
 
         if len(rows) < 4:
             self._last_fit_x = self._last_fit_y = None
             self._last_fit_inputs = {}
-            self.statusLabel.setText(self._overall_status_html(None, None))
-            self.xCard.setText(
-                f"Accepted: {len(rows)} unique plane(s) after replicate aggregation "
-                f"({len(self._checked_samples())} raw row(s) checked)."
-            )
-            self.yCard.setText("")
-            self.diagnosticsLabel.setText("")
+            self._render_results(n_planes=len(rows))
+            self.diagnosticsLabel.setText("Log \u2265 4 Z positions to see fit diagnostics.")
             if rows:
                 z = np.array([r[0] for r in rows])
                 dx = np.array([r[1] for r in rows])
                 dy = np.array([r[2] for r in rows])
-                self.ax.scatter(z, dx, marker="o", label="X")
-                self.ax.scatter(z, dy, marker="s", label="Y")
-                self.ax.legend()
+                self.ax.scatter(z, dx, facecolors="none", edgecolors="C0", s=45, linewidths=1.4,
+                                label="X", zorder=4)
+                self.ax.scatter(z, dy, marker="s", color="C1", s=18, label="Y", zorder=3)
+            self.ax.text(0.5, 0.5, "Log ≥ 4 Z positions to fit", transform=self.ax.transAxes,
+                         ha="center", va="center", color="gray", fontsize=9)
+            self._style_axes()
+            self._legend()
             self.main_canvas.draw_idle()
             self.diag_canvas.draw_idle()
             return
@@ -3518,49 +4442,62 @@ class PropagationPanel(QWidget):
         fit_y = fit_propagation_axis(z, dy, wavelength, spread_um=dy_spread)
 
         # Raw (pre-aggregation) points shown lightly for context; the
-        # aggregated points actually being fitted are shown bold on top.
+        # aggregated points actually being fitted are drawn on top. X uses
+        # hollow circles so it stays visible when X and Y overlap exactly.
         use_d4 = self.methodCombo.currentIndex() == 0
         raw_checked = [s for s in self._checked_samples() if s.z_mm is not None]
         raw_z = np.array([s.z_mm for s in raw_checked], dtype=float)
         raw_dx = np.array([(s.d4sigma_x_um if use_d4 else s.gaussian_x_um) or np.nan for s in raw_checked], dtype=float)
         raw_dy = np.array([(s.d4sigma_y_um if use_d4 else s.gaussian_y_um) or np.nan for s in raw_checked], dtype=float)
         if raw_z.size:
-            self.ax.scatter(raw_z, raw_dx, marker=".", color="C0", alpha=0.35, s=25)
-            self.ax.scatter(raw_z, raw_dy, marker=".", color="C1", alpha=0.35, s=25)
-        self.ax.scatter(z, dx, marker="o", color="C0", label="X (aggregated)")
-        self.ax.scatter(z, dy, marker="s", color="C1", label="Y (aggregated)")
+            self.ax.scatter(raw_z, raw_dx, marker=".", color="C0", alpha=0.35, s=25, zorder=2)
+            self.ax.scatter(raw_z, raw_dy, marker=".", color="C1", alpha=0.35, s=25, zorder=2)
+        self.ax.scatter(z, dx, facecolors="none", edgecolors="C0", s=45, linewidths=1.4,
+                        label="X", zorder=4)
+        self.ax.scatter(z, dy, marker="s", color="C1", s=18, label="Y", zorder=3)
+
+        # Zones are drawn AFTER the points (they still sit behind them via
+        # zorder=0). Order matters: after ax.clear(), the first artist added
+        # resets the data limits, and axvspan/axvline only carry x-limits --
+        # drawing them first would leave the previous dataset's y-range stuck.
+        self._shade_zones(fit_x, fit_y, z)
 
         self._last_fit_inputs = {}
-        for name, fit, color in (("X", fit_x, "C0"), ("Y", fit_y, "C1")):
+        x_lo, x_hi = self.ax.get_xlim()
+        for name, fit, color, style in (("X", fit_x, "C0", "-"), ("Y", fit_y, "C1", "--")):
             if fit is None:
                 continue
-            z_grid = np.linspace(float(z.min()), float(z.max()), 500)
+            # Draw the fit across the whole visible range (including the
+            # shaded far-field area), not just between the data points.
+            z_grid = np.linspace(min(x_lo, float(z.min())), max(x_hi, float(z.max())), 500)
             radius_grid = propagation_radius_model(z_grid, fit["w0_um"], fit["z0_mm"], fit["m2"], wavelength)
-            self.ax.plot(z_grid, 2.0 * radius_grid, color=color, label=f"{name} fit")
-            self.resid_ax.scatter(fit["z"], fit["observed_radius_um"] - fit["predicted_radius_um"],
-                                   color=color, label=name)
+            self.ax.plot(z_grid, 2.0 * radius_grid, color=color, linestyle=style, linewidth=1.3,
+                         label=f"{name} fit", zorder=3)
+            resid = fit["observed_radius_um"] - fit["predicted_radius_um"]
+            if name == "X":  # hollow, so X stays visible when it overlaps Y
+                self.resid_ax.scatter(fit["z"], resid, facecolors="none", edgecolors=color,
+                                       s=40, linewidths=1.3, label=name, zorder=4)
+            else:
+                self.resid_ax.scatter(fit["z"], resid, marker="s", color=color, s=16,
+                                       label=name, zorder=3)
             self._last_fit_inputs[name] = {
                 "z": fit["z"], "w": fit["observed_radius_um"], "wavelength": wavelength,
                 "sigma": fit["_sigma"], "lower": fit["_lower_bounds"], "upper": fit["_upper_bounds"],
             }
+        self.ax.set_xlim(x_lo, x_hi)
+        # Recompute the y-range from what is actually plotted now.
+        self.ax.relim(visible_only=True)
+        self.ax.autoscale_view(scalex=False, scaley=True)
 
-        self.ax.legend(fontsize=8)
-        self.ax.grid(True, alpha=0.25)
-
-        self._draw_zone_bar(self.zone_ax, fit_x, 1.0, z)
-        self._draw_zone_bar(self.zone_ax, fit_y, 0.0, z)
-        self.zone_ax.set_yticks([0.0, 1.0])
-        self.zone_ax.set_yticklabels(["Y", "X"])
-        self.zone_ax.set_ylim(-0.6, 1.6)
-        self.zone_ax.set_title("Coverage: green = near-waist, gold = transition, red = far-field target", fontsize=8)
-
+        self._style_axes()
+        self._legend()
         self.resid_ax.axhline(0.0, linewidth=1)
-        self.resid_ax.legend(fontsize=8)
-        self.resid_ax.grid(True, alpha=0.25)
+        if self.resid_ax.get_legend_handles_labels()[0]:
+            self.resid_ax.legend(fontsize=7, frameon=False)
 
         self._last_fit_x, self._last_fit_y = fit_x, fit_y
         self._bootstrap_results = {}  # invalidate any cached CI now that the fit input changed
-        self._render_results()
+        self._render_results(n_planes=len(rows))
 
         self.main_canvas.draw_idle()
         self.diag_canvas.draw_idle()
@@ -3572,7 +4509,7 @@ class PropagationPanel(QWidget):
             QMessageBox.information(self, "Nothing to finalize", "Fit at least one axis first.")
             return
         self.finalizeButton.setEnabled(False)
-        self.finalizeButton.setText("Running bootstrap (n=300)…")
+        self.finalizeButton.setText("Computing CI (n=300)…")
         QApplication.processEvents()
         try:
             for name, inputs in self._last_fit_inputs.items():
@@ -3582,8 +4519,8 @@ class PropagationPanel(QWidget):
                 )
         finally:
             self.finalizeButton.setEnabled(True)
-            self.finalizeButton.setText("Finalize Analysis (bootstrap 95% CI)")
-        self._render_results()
+            self.finalizeButton.setText(self.CI_BUTTON_TEXT)
+        self._render_results(n_planes=len(self._selected_data()[0]))
 
     # -- save / load / export --------------------------------------------------
 
@@ -3595,7 +4532,7 @@ class PropagationPanel(QWidget):
             "schema_version": 2,
             "saved_at": datetime.now().isoformat(timespec="seconds"),
             "wavelength_nm": self.wavelengthSpin.value(),
-            "method": self.methodCombo.currentText(),
+            "method": self.METHOD_FULL_NAMES[self.methodCombo.currentIndex()],
             "direction": self.directionCombo.currentText(),
             "lens_focal_length_mm": self.lensEdit.value() or None,
             "scope_note": PROPAGATION_SCOPE_NOTE,
@@ -3618,10 +4555,13 @@ class PropagationPanel(QWidget):
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
             QMessageBox.critical(self, "Load failed", str(exc))
             return
+        # Old sessions have no log_order: number them in file order.
+        for i, sample in enumerate(loaded, start=1):
+            if sample.log_order is None:
+                sample.log_order = i
         self.samples = loaded
-        self.table.setRowCount(0)
-        for sample in self.samples:
-            self._append_row(sample)
+        self._next_log_order = max((s.log_order for s in loaded), default=0) + 1
+        self._rebuild_table(select_ids=set())
         self.wavelengthSpin.setValue(float(payload.get("wavelength_nm", self.wavelengthSpin.value())))
         self.calibrationWarningLabel.setVisible(False)
         self._bootstrap_results = {}
@@ -3669,6 +4609,7 @@ class CameraCommandBridge(QObject):
     dark_requested = pyqtSignal(int)
     stop_requested = pyqtSignal()
     demo_diameter_requested = pyqtSignal(float)
+    demo_center_requested = pyqtSignal(float, float)
 
 
 class UploadImagePanel(QWidget):
@@ -3682,6 +4623,7 @@ class UploadImagePanel(QWidget):
 
     def __init__(self):
         super().__init__()
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         layout = QVBoxLayout(self)
 
         def section_label(text):
@@ -3700,17 +4642,28 @@ class UploadImagePanel(QWidget):
         self.selectedFileLabel.setWordWrap(True)
         layout.addWidget(self.selectedFileLabel)
 
+        # Info/warning rows stay hidden until they have text, so an empty
+        # panel doesn't show blank gaps.
         self.metadataLabel = QLabel("")
         self.metadataLabel.setWordWrap(True)
+        self.metadataLabel.setVisible(False)
         layout.addWidget(self.metadataLabel)
+
+        self.infoLabel = QLabel("")
+        self.infoLabel.setWordWrap(True)
+        set_role(self.infoLabel, "ok")
+        self.infoLabel.setVisible(False)
+        layout.addWidget(self.infoLabel)
 
         self.warningsLabel = QLabel("")
         self.warningsLabel.setWordWrap(True)
-        self.warningsLabel.setStyleSheet("color: #b36b00;")
+        set_role(self.warningsLabel, "warn")
+        self.warningsLabel.setVisible(False)
         layout.addWidget(self.warningsLabel)
 
         channel_row = QHBoxLayout()
-        channel_row.addWidget(QLabel("Channel (if multi-channel):"))
+        self.channelLabel = QLabel("Channel (if multi-channel):")
+        channel_row.addWidget(self.channelLabel)
         self.channelCombo = QComboBox()
         self.channelCombo.addItems(["Luminance (qualitative)", "Red", "Green", "Blue"])
         channel_row.addWidget(self.channelCombo)
@@ -3754,21 +4707,32 @@ class UploadImagePanel(QWidget):
             if result["pixel_pitch_um"] is not None else
             f"{w}x{h}, dtype {result['array'].dtype}\nImage scale: not available -- enter manually"
         )
-        self.warningsLabel.setText("\n".join(f"\u26A0 {msg}" for msg in result["warnings"]))
-        self.channelCombo.setVisible(bool(result["is_rgb_source"]))
+        infos = [msg for msg in result["warnings"] if msg.startswith(SIDECAR_OK_PREFIX)]
+        warns = [msg for msg in result["warnings"] if not msg.startswith(SIDECAR_OK_PREFIX)]
+        self._set_row(self.metadataLabel, self.metadataLabel.text())
+        self._set_row(self.infoLabel, "\n".join(f"\u2713 {msg}" for msg in infos))
+        self._set_row(self.warningsLabel, "\n".join(f"\u26A0 {msg}" for msg in warns))
+        is_rgb = bool(result["is_rgb_source"])
+        self.channelLabel.setVisible(is_rgb)
+        self.channelCombo.setVisible(is_rgb)
         if result["pixel_pitch_um"] is not None:
             self.pixelScaleSpinBox.setValue(float(result["pixel_pitch_um"]))
         else:
             self.pixelScaleSpinBox.setValue(0.0)
         self._update_load_enabled()
 
+    @staticmethod
+    def _set_row(label, text):
+        label.setText(text)
+        label.setVisible(bool(text))
+
     def _update_load_enabled(self):
         self.loadButton.setEnabled(self.pixelScaleSpinBox.value() > 0)
 
     def clear_selection(self):
         self.selectedFileLabel.setText("Selected: No image selected")
-        self.metadataLabel.setText("")
-        self.warningsLabel.setText("")
+        for label in (self.metadataLabel, self.infoLabel, self.warningsLabel):
+            self._set_row(label, "")
         self.pixelScaleSpinBox.setValue(0.0)
         self.loadButton.setEnabled(False)
         self.reprocessButton.setEnabled(False)
@@ -3811,14 +4775,20 @@ class MainWindow(QMainWindow):
         self.sub_waist = self.add_panel(self.analyze_panel, "Calculations", 930, 20, 400, 600)
         self.sub_advanced = self.add_panel(self.advanced_panel, "Advanced Settings", 950, 20, 378, 690, visible=False)
         self.sub_stability = self.add_panel(self.stability_panel, "Beam Stability", 970, 60, 320, 260, visible=False)
-        self.sub_propagation = self.add_panel(self.propagation_panel, "Propagation / M² Analysis", 60, 60, 1165, 451, visible=False)
+        self.sub_propagation = self.add_panel(self.propagation_panel, "Propagation / M² Analysis", 60, 60, 1165, 650, visible=False)
         self.sub_upload = self.add_panel(self.upload_panel, "Upload Image", 950, 60, 381, 324, visible=False)
+        for sub in (self.sub_controls, self.sub_waist, self.sub_advanced, self.sub_upload):
+            sub.fit_on_first_show = True
+        # Runs once the window is on screen: fit panels, then line them up.
+        QTimer.singleShot(0, self._arrange_launch_layout)
 
         self.control_panel.connectCameraButton.clicked.connect(self.connect_selected_camera)
         self.control_panel.scanCamerasButton.clicked.connect(self.scan_for_cameras)
         self.control_panel.captureButton.clicked.connect(self.capture_image)
         self.control_panel.exposureSpinBox.valueChanged.connect(self.update_camera_settings)
         self.control_panel.demoDiameterSpinBox.valueChanged.connect(self.update_demo_beam_diameter)
+        self.control_panel.demoCenterXSpinBox.valueChanged.connect(self.update_demo_beam_center)
+        self.control_panel.demoCenterYSpinBox.valueChanged.connect(self.update_demo_beam_center)
         self.control_panel.cameraBackendCombo.currentTextChanged.connect(self.on_camera_backend_changed)
         self.upload_panel.browseButton.clicked.connect(self.browse_upload_image)
         self.upload_panel.loadButton.clicked.connect(self.load_uploaded_image)
@@ -3840,17 +4810,24 @@ class MainWindow(QMainWindow):
         self.advanced_panel.showIntegrationAreaCheckbox.toggled.connect(self._on_static_source_setting_changed)
         self.control_panel.opacitySlider.valueChanged.connect(self.update_raw_data_opacity)
         self.control_panel.overlayHeightSlider.valueChanged.connect(self.update_overlay_height)
+        self.control_panel.overlayHeightSlider.valueChanged.connect(self._schedule_static_redraw)
+        self.control_panel.overlayAnchorCombo.currentTextChanged.connect(self._on_static_source_setting_changed)
+        self.control_panel.hideTailsCheckbox.toggled.connect(self._on_static_source_setting_changed)
+        self.control_panel.cmapCombo.currentTextChanged.connect(self._on_static_source_setting_changed)
+        self.control_panel.zoomSlider.valueChanged.connect(self._schedule_static_redraw)
+        self.camera_panel.gridLabelSizeSpinBox.valueChanged.connect(self._schedule_static_redraw)
         self.camera_panel.gridLabelSizeSpinBox.valueChanged.connect(self.update_overlay_text_scale)
 
         self.camera_panel.zoomSpinBox.valueChanged.connect(self.control_panel.zoomSpinBox.setValue)
         self.control_panel.zoomSpinBox.valueChanged.connect(self.camera_panel.zoomSpinBox.setValue)
         self.analyze_panel.logButton.toggled.connect(self.toggle_logging)
+        self.analyze_panel.copyLogPathButton.clicked.connect(self.copy_log_path)
         self.control_panel.percentModeCheckbox.toggled.connect(self.update_intensity_mode)
 
-        self.advanced_panel.averagingSpinBox.valueChanged.connect(self.update_averaging)
+        self.control_panel.averagingSpinBox.valueChanged.connect(self.update_averaging)
         self.advanced_panel.resetHoldButton.clicked.connect(self.reset_hold_maximum)
         self.advanced_panel.resetDefaultsButton.clicked.connect(self.reset_advanced_defaults)
-        self.advanced_panel.captureDarkButton.clicked.connect(self.capture_dark_frame)
+        self.control_panel.captureDarkButton.clicked.connect(self.capture_dark_frame)
 
         self.overlay_curve_height = OVERLAY_CURVE_HEIGHT
         self.overlay_text_scale = 0.5
@@ -3875,6 +4852,7 @@ class MainWindow(QMainWindow):
         self._camera_bridge.dark_requested.connect(self._camera_worker.request_dark_frame)
         self._camera_bridge.stop_requested.connect(self._camera_worker.stop)
         self._camera_bridge.demo_diameter_requested.connect(self._camera_worker.set_demo_beam_diameter_um)
+        self._camera_bridge.demo_center_requested.connect(self._camera_worker.set_demo_beam_center_um)
         self._camera_worker.connected.connect(self._on_camera_connected)
         self._camera_worker.disconnected.connect(self._on_camera_disconnected)
         self._camera_worker.error.connect(self._on_camera_error)
@@ -3957,6 +4935,20 @@ class MainWindow(QMainWindow):
         self._latest_processed_frame = None
 
         self._last_video_label_size = (None, None)
+        self._demo_dragging = False
+        self.camera_panel.videoLabel.installEventFilter(self)
+
+        # Uploaded (static) images only redraw when something asks them to.
+        # This single-shot timer collapses bursts of scroll/resize/slider
+        # events into one redraw ~120 ms after the last one.
+        self._static_redraw_timer = QTimer(self)
+        self._static_redraw_timer.setSingleShot(True)
+        self._static_redraw_timer.setInterval(120)
+        self._static_redraw_timer.timeout.connect(self._on_static_source_setting_changed)
+        self._camera_viewport = self.camera_panel.scrollArea.viewport()
+        self._camera_viewport.installEventFilter(self)
+        self.camera_panel.scrollArea.horizontalScrollBar().valueChanged.connect(self._schedule_edge_overlay_redraw)
+        self.camera_panel.scrollArea.verticalScrollBar().valueChanged.connect(self._schedule_edge_overlay_redraw)
 
         self.frame_counter = 0
         self._consecutive_bad_frames = 0
@@ -3973,6 +4965,8 @@ class MainWindow(QMainWindow):
 
         self._build_menu_and_toolbar()
         self._load_settings()
+        self.toggle_theme(self.action_dark_mode.isChecked())
+        self._update_backend_dependent_visibility(self.control_panel.cameraBackendCombo.currentText())
         self.scan_for_cameras()
         self.connect_selected_camera(show_errors=False)
         if not self.timer.isActive():
@@ -4080,6 +5074,9 @@ class MainWindow(QMainWindow):
         self.action_dark_mode.setCheckable(True)
         self.action_dark_mode.toggled.connect(self.toggle_theme)
         view_menu.addAction(self.action_dark_mode)
+        fit_action = QAction("Fit Panels to Contents", self)
+        fit_action.triggered.connect(self.fit_panels_exactly)
+        view_menu.addAction(fit_action)
 
         tools_menu = menu_bar.addMenu("&Tools")
         tools_menu.addAction(self.action_propagation)
@@ -4200,6 +5197,48 @@ class MainWindow(QMainWindow):
     def toggle_upload(self, checked):
         self.sub_upload.setVisible(checked)
 
+    def _arrange_launch_layout(self):
+        """At launch: Controls and Calculations grow to fit their contents
+        (keeping their default positions), and Calculations moves right if
+        needed so the two don't overlap. The Camera, Beam Profile, Stability
+        and Propagation panels are left exactly as they are. Hidden panels
+        (Advanced Settings, Upload Image) are fitted the first time they open."""
+        if not self.isVisible():
+            QTimer.singleShot(50, self._arrange_launch_layout)
+            return
+        gap = 10
+        for sub in (self.sub_controls, self.sub_waist):
+            if sub.isVisible():
+                sub._auto_fitted = True
+                sub.fit_to_contents(exact=True)
+        self._separate_controls_and_calculations()
+
+    def _separate_controls_and_calculations(self):
+        """If Controls and Calculations overlap, move Calculations to the
+        right of Controls (staying inside the workspace)."""
+        gap = 10
+        c, k = self.sub_controls, self.sub_waist
+        if c.isVisible() and k.isVisible() and k.geometry().intersects(c.geometry()):
+            view_w = self.mdiArea.viewport().width()
+            k.move(min(c.x() + c.width() + gap, max(0, view_w - k.width())), k.y())
+
+    _fit_exact_request = False
+
+    def fit_panels_exactly(self):
+        """View > Fit Panels to Contents: exact fit (may shrink)."""
+        self._fit_exact_request = True
+        try:
+            self.fit_visible_panels()
+        finally:
+            self._fit_exact_request = False
+
+    def fit_visible_panels(self):
+        """View > Fit Panels to Contents: grow every visible fit-able panel."""
+        for sub in (self.sub_controls, self.sub_waist, self.sub_advanced, self.sub_upload):
+            if sub.isVisible():
+                sub.fit_to_contents(exact=self._fit_exact_request)
+        self._separate_controls_and_calculations()
+
     def add_panel(self, widget, title, x, y, w, h, visible=True):
         sub = PersistentSubWindow()
         sub.setWidget(widget)
@@ -4211,11 +5250,27 @@ class MainWindow(QMainWindow):
 
 
     def toggle_theme(self, checked):
-        self.dark_mode = checked
-        app = QApplication.instance()
-        app.setStyleSheet(DARK_QSS if checked else LIGHT_QSS)
-        for panel in (self.graph_panel_x, self.graph_panel_y, self.stability_panel):
+        global CURRENT_THEME
+        self.dark_mode = bool(checked)
+        CURRENT_THEME = "dark" if checked else "light"
+        QApplication.instance().setStyleSheet(build_theme_qss(CURRENT_THEME))
+        # The workspace behind the panels ignores stylesheets; set it directly.
+        # Dark mode keeps Qt's own default workspace gray, as it always had.
+        if not hasattr(self, "_default_mdi_brush"):
+            self._default_mdi_brush = QBrush(self.mdiArea.background())
+        if checked:
+            self.mdiArea.setBackground(self._default_mdi_brush)
+        else:
+            self.mdiArea.setBackground(QBrush(QColor(theme_color("workspace"))))
+        for panel in (self.graph_panel_x, self.graph_panel_y, self.stability_panel,
+                      self.propagation_panel):
             panel.set_theme(checked)
+        # Status colors (saturation readout etc.) are set per frame; an
+        # uploaded image has no next frame, so redraw it once.
+        self._on_static_source_setting_changed()
+        # The two themes pad widgets slightly differently: re-check the fit.
+        if getattr(self, "sub_controls", None) is not None and self.isVisible():
+            QTimer.singleShot(0, self.fit_visible_panels)
 
     def show_about(self):
         if self._camera_connected:
@@ -4287,12 +5342,18 @@ class MainWindow(QMainWindow):
             "device_text": device_text, "exposure_ms": self.control_panel.exposureSpinBox.value(),
             "show_errors": bool(show_errors),
             "demo_diameter_um": self.control_panel.demoDiameterSpinBox.value(),
+            "demo_center_x_um": self.control_panel.demoCenterXSpinBox.value(),
+            "demo_center_y_um": self.control_panel.demoCenterYSpinBox.value(),
         })
 
     @pyqtSlot(object)
     def _on_camera_connected(self, info):
         self._camera_connected = True
         self.current_camera_backend_name = info["backend_name"]
+        if self.current_camera_backend_name == DemoCameraBackend.name:
+            # Re-send in case the boxes changed while the camera was connecting.
+            self.update_demo_beam_diameter(self.control_panel.demoDiameterSpinBox.value())
+            self.update_demo_beam_center()
         self.sensor_type = info.get("sensor_type")
         self.sensor_bit_depth = int(info["sensor_bit_depth"])
         self.sensor_max_raw = int(info["sensor_max_raw"])
@@ -4343,19 +5404,21 @@ class MainWindow(QMainWindow):
         self.control_panel.exposureSpinBox.setToolTip(exposure_tip)
         self.control_panel.exposureSlider.setToolTip(exposure_tip)
 
-        self.advanced_panel.captureDarkButton.setEnabled(caps["supports_dark_capture"])
-        self.advanced_panel.darkEnableCheckbox.setEnabled(caps["supports_dark_capture"])
-        dark_tip = "" if caps["supports_dark_capture"] else "Dark-frame acquisition/subtraction unavailable for this source."
-        self.advanced_panel.captureDarkButton.setToolTip(dark_tip)
-        self.advanced_panel.darkEnableCheckbox.setToolTip(dark_tip)
+        self.control_panel.captureDarkButton.setEnabled(caps["supports_dark_capture"])
+        self.control_panel.darkEnableCheckbox.setEnabled(caps["supports_dark_capture"])
+        no_dark_tip = "Dark-frame acquisition/subtraction unavailable for this source."
+        self.control_panel.captureDarkButton.setToolTip(
+            DARK_CAPTURE_TIP if caps["supports_dark_capture"] else no_dark_tip)
+        self.control_panel.darkEnableCheckbox.setToolTip(
+            DARK_APPLY_TIP if caps["supports_dark_capture"] else no_dark_tip)
         if not caps["supports_dark_capture"]:
-            self.advanced_panel.darkEnableCheckbox.setChecked(False)
+            self.control_panel.darkEnableCheckbox.setChecked(False)
 
-        self.advanced_panel.averagingSpinBox.setEnabled(caps["supports_frame_averaging"])
-        avg_tip = "" if caps["supports_frame_averaging"] else "Not applicable to a single static source."
-        self.advanced_panel.averagingSpinBox.setToolTip(avg_tip)
+        self.control_panel.averagingSpinBox.setEnabled(caps["supports_frame_averaging"])
+        avg_tip = AVERAGING_TIP if caps["supports_frame_averaging"] else "Not applicable to a single static source."
+        self.control_panel.averagingSpinBox.setToolTip(avg_tip)
         if not caps["supports_frame_averaging"]:
-            self.advanced_panel.averagingSpinBox.setValue(1)
+            self.control_panel.averagingSpinBox.setValue(1)
 
         self.advanced_panel.holdMaxCheckbox.setEnabled(caps["supports_peak_hold"])
         self.advanced_panel.resetHoldButton.setEnabled(caps["supports_peak_hold"])
@@ -4382,7 +5445,7 @@ class MainWindow(QMainWindow):
         self._last_frame_ts = None; self._fps_smoothed = None
         self._display_fps_smoothed = None; self._last_display_ts = None; self._analysis_ms_smoothed = None
         self._hold_max_frame = None; self._latest_raw_frame = None; self._latest_raw_packet = None
-        self._frame_buffer = collections.deque(maxlen=self.advanced_panel.averagingSpinBox.value())
+        self._frame_buffer = collections.deque(maxlen=self.control_panel.averagingSpinBox.value())
         self._frame_sum = None; self._analysis_buffer = None
         self._numbers_x_cache = None; self._numbers_y_cache = None
         self._last_gaussian_popt_x = None; self._last_gaussian_popt_y = None
@@ -4394,6 +5457,7 @@ class MainWindow(QMainWindow):
     def _on_camera_disconnected(self):
         self._camera_connected = False
         self.current_camera_backend_name = None
+        self._update_demo_drag_cursor()
         self.current_backend_capabilities = None
         self._upload_source_filename = None
         self._apply_backend_capabilities()
@@ -4411,8 +5475,8 @@ class MainWindow(QMainWindow):
     def _on_dark_frame_ready(self, dark, metadata):
         self._dark_frame = np.asarray(dark).copy()
         self._dark_metadata = dict(metadata)
-        self.advanced_panel.darkEnableCheckbox.setChecked(True)
-        self.advanced_panel.darkStatusLabel.setText("Dark frame: valid and enabled")
+        self.control_panel.darkEnableCheckbox.setChecked(True)
+        self.control_panel.darkStatusLabel.setText("Dark frame: valid and enabled")
         self._frame_buffer.clear(); self._frame_sum = None; self._analysis_buffer = None; self._hold_max_frame = None
 
     @pyqtSlot(str)
@@ -4425,16 +5489,20 @@ class MainWindow(QMainWindow):
             "camera_backend": self.control_panel.cameraBackendCombo.currentText(),
             "exposure_ms": self.control_panel.exposureSpinBox.value(),
             "demo_diameter_um": self.control_panel.demoDiameterSpinBox.value(),
+            "demo_center_x_um": self.control_panel.demoCenterXSpinBox.value(),
+            "demo_center_y_um": self.control_panel.demoCenterYSpinBox.value(),
             "grid_label_size": self.camera_panel.gridLabelSizeSpinBox.value(),
             "pixel_pitch": self.analyze_panel.pixel_pitch_input.value(),
             "colormap": self.control_panel.cmapCombo.currentText(),
             "opacity": self.control_panel.opacitySlider.value(),
             "zoom": self.control_panel.zoomSlider.value(),
             "overlay_height": self.overlay_curve_height,
+            "overlay_anchor": self.control_panel.overlayAnchorCombo.currentText(),
+            "overlay_hide_tails": self.control_panel.hideTailsCheckbox.isChecked(),
             "percent_mode": self.control_panel.percentModeCheckbox.isChecked(),
             "max_display_fps": self.advanced_panel.maxFpsSpinBox.value(),
             "gaussian_r2_min": self.advanced_panel.gaussianR2SpinBox.value(),
-            "averaging": self.advanced_panel.averagingSpinBox.value(),
+            "averaging": self.control_panel.averagingSpinBox.value(),
             "show_integration_area": self.advanced_panel.showIntegrationAreaCheckbox.isChecked(),
             "show_grid": self.camera_panel.showGridCheckbox.isChecked(),
             "show_gaussian_fit": self.camera_panel.showGaussianFitCheckbox.isChecked(),
@@ -4446,7 +5514,7 @@ class MainWindow(QMainWindow):
             "wavelength_nm": self.advanced_panel.wavelengthSpinBox.value(),
             "power_cal_factor": self.advanced_panel.powerCalSpinBox.value(),
             "power_unit": self.advanced_panel.powerUnitCombo.currentText(),
-            "dark_frame_enabled": self.advanced_panel.darkEnableCheckbox.isChecked(),
+            "dark_frame_enabled": self.control_panel.darkEnableCheckbox.isChecked(),
             "minimum_snr": self.advanced_panel.minSnrSpinBox.value(),
             "bad_pixel_mask_enabled": self.advanced_panel.badPixelMaskCheckbox.isChecked(),
             "hold_maximum_enabled": self.advanced_panel.holdMaxCheckbox.isChecked(),
@@ -4461,6 +5529,10 @@ class MainWindow(QMainWindow):
 
         self.control_panel.exposureSpinBox.setValue(float(d.get("exposure_ms", 5.0)))
         self.control_panel.demoDiameterSpinBox.setValue(float(d.get("demo_diameter_um", 500.0)))
+        self.control_panel.demoCenterXSpinBox.setValue(
+            float(d.get("demo_center_x_um", SETTINGS_DEFAULTS["demo_center_x_um"])))
+        self.control_panel.demoCenterYSpinBox.setValue(
+            float(d.get("demo_center_y_um", SETTINGS_DEFAULTS["demo_center_y_um"])))
         self.camera_panel.gridLabelSizeSpinBox.setValue(int(d.get("grid_label_size", 50)))
         self.analyze_panel.pixel_pitch_input.setValue(float(d.get("pixel_pitch", 3.45)))
 
@@ -4472,11 +5544,15 @@ class MainWindow(QMainWindow):
         self.control_panel.opacitySlider.setValue(int(d.get("opacity", DEFAULT_RAW_DATA_OPACITY_PERCENT)))
         self.control_panel.zoomSlider.setValue(int(d.get("zoom", 60)))
         self.control_panel.overlayHeightSlider.setValue(int(d.get("overlay_height", OVERLAY_CURVE_HEIGHT)))
+        anchor_idx = self.control_panel.overlayAnchorCombo.findText(
+            str(d.get("overlay_anchor", OVERLAY_ANCHOR_CENTER)))
+        self.control_panel.overlayAnchorCombo.setCurrentIndex(max(0, anchor_idx))
+        self.control_panel.hideTailsCheckbox.setChecked(bool(d.get("overlay_hide_tails", False)))
         self.control_panel.percentModeCheckbox.setChecked(bool(d.get("percent_mode", False)))
 
         self.advanced_panel.maxFpsSpinBox.setValue(int(d.get("max_display_fps", DEFAULT_MAX_DISPLAY_FPS)))
         self.advanced_panel.gaussianR2SpinBox.setValue(float(d.get("gaussian_r2_min", GAUSSIAN_R2_MIN)))
-        self.advanced_panel.averagingSpinBox.setValue(int(d.get("averaging", 1)))
+        self.control_panel.averagingSpinBox.setValue(int(d.get("averaging", 1)))
         # Overlay-visibility checkboxes are wired to _on_static_source_setting_changed
         # (see __init__), which can trigger reprocess_current_frame(). Block
         # signals while restoring so loading settings doesn't fire several
@@ -4496,7 +5572,7 @@ class MainWindow(QMainWindow):
         self.advanced_panel.psfSpinBox.setValue(float(d.get("psf_um", 0.0)))
         self.advanced_panel.wavelengthSpinBox.setValue(float(d.get("wavelength_nm", 780.0)))
         self.advanced_panel.powerCalSpinBox.setValue(float(d.get("power_cal_factor", 0.0)))
-        self.advanced_panel.darkEnableCheckbox.setChecked(bool(d.get("dark_frame_enabled", False)))
+        self.control_panel.darkEnableCheckbox.setChecked(bool(d.get("dark_frame_enabled", False)))
         self.advanced_panel.minSnrSpinBox.setValue(float(d.get("minimum_snr", 10.0)))
         self.advanced_panel.badPixelMaskCheckbox.setChecked(bool(d.get("bad_pixel_mask_enabled", False)))
         self.advanced_panel.holdMaxCheckbox.setChecked(bool(d.get("hold_maximum_enabled", False)))
@@ -4550,13 +5626,14 @@ class MainWindow(QMainWindow):
         self.control_panel.cameraBackendCombo.blockSignals(True)
         self._apply_settings_dict(SETTINGS_DEFAULTS)
         self.control_panel.cameraBackendCombo.blockSignals(False)
+        self._update_backend_dependent_visibility(self.control_panel.cameraBackendCombo.currentText())
         self.scan_for_cameras()
 
         # Configuration-adjacent session state that should go with a
         # factory reset, even though it isn't itself a QSettings key.
         self._dark_frame = None
         self._dark_metadata = None
-        self.advanced_panel.darkStatusLabel.setText("Dark frame: not captured")
+        self.control_panel.darkStatusLabel.setText("Dark frame: not captured")
         self.reset_hold_maximum()
 
         # Persist the now-default state immediately, so nothing depends on
@@ -4662,7 +5739,8 @@ class MainWindow(QMainWindow):
     def reset_advanced_defaults(self):
         self.advanced_panel.gaussianR2SpinBox.setValue(GAUSSIAN_R2_MIN)
         self.advanced_panel.maxFpsSpinBox.setValue(DEFAULT_MAX_DISPLAY_FPS)
-        self.advanced_panel.averagingSpinBox.setValue(1)
+        self.advanced_panel.minSnrSpinBox.setValue(SETTINGS_DEFAULTS["minimum_snr"])
+        self.advanced_panel.badPixelMaskCheckbox.setChecked(False)
         self.advanced_panel.calcAreaCheckbox.setChecked(False)
         self.advanced_panel.calcAreaSpinBox.setValue(200)
         self.advanced_panel.showIntegrationAreaCheckbox.setChecked(False)
@@ -4672,6 +5750,37 @@ class MainWindow(QMainWindow):
         self.advanced_panel.wavelengthSpinBox.setValue(780.0)
         self.advanced_panel.powerCalSpinBox.setValue(0.0)
         self.advanced_panel.powerUnitCombo.setCurrentIndex(0)
+
+    def _refit_calculations_later(self):
+        if self.isVisible() and self.sub_waist.isVisible():
+            QTimer.singleShot(0, self._refit_calculations_now)
+
+    def _refit_calculations_now(self):
+        self.sub_waist.fit_to_contents()
+        self._separate_controls_and_calculations()
+
+    def _show_log_status(self, first_line):
+        """Log status text: first line plus the folder on its own line. A
+        zero-width space after each path separator lets a long folder path
+        wrap at '/' instead of widening the panel; the full path is in the
+        tooltip, and Copy Path copies it without those invisible characters."""
+        path = getattr(self, "_last_log_path", None)
+        text = first_line
+        if path:
+            folder = os.path.dirname(path)
+            breakable = folder.replace("/", "/\u200b").replace("\\", "\\\u200b")
+            text += f"\nFolder: {breakable}"
+        label = self.analyze_panel.logStatusLabel
+        label.setText(text)
+        label.setToolTip(path or "")
+        self.analyze_panel.copyLogPathButton.setEnabled(bool(path))
+        # The status text changed length: re-check the Calculations size.
+        self._refit_calculations_later()
+
+    def copy_log_path(self):
+        path = getattr(self, "_last_log_path", None)
+        if path:
+            QApplication.clipboard().setText(path)
 
     def toggle_logging(self, checked):
         if checked:
@@ -4686,17 +5795,21 @@ class MainWindow(QMainWindow):
                 "d4sigma_x_um", "d4sigma_x_px", "d4sigma_y_um", "d4sigma_y_px",
                 "d4sigma_major_um", "d4sigma_major_px", "d4sigma_minor_um", "d4sigma_minor_px",
                 "orientation_deg", "ellipticity", "moment_truncated",
+                "source_file", "gaussian_x_um", "gaussian_y_um", "status",
             ])
             self._log_row_count = 0
             self._set_text_if_changed(self.analyze_panel.logButton, "Stop Logging")
-            self._set_text_if_changed(self.analyze_panel.logStatusLabel, f"Logging: {filename}")
+            self._last_log_path = os.path.abspath(filename)
+            self._show_log_status(f"Logging to: {filename}")
         else:
             if self._log_file is not None:
                 self._log_file.close()
             self._log_file = None
             self._log_writer = None
             self._set_text_if_changed(self.analyze_panel.logButton, "Start Logging")
-            self._set_text_if_changed(self.analyze_panel.logStatusLabel, f"Logging: Off ({self._log_row_count} rows saved)")
+            last = getattr(self, "_last_log_path", None)
+            self._show_log_status(f"Logging: Off ({self._log_row_count} rows saved)"
+                                  + (f"\nLast log: {os.path.basename(last)}" if last else ""))
 
     def snap_to_beam(self):
         zoom = self.control_panel.zoomSlider.value() / 100.0
@@ -4710,16 +5823,23 @@ class MainWindow(QMainWindow):
         self.camera_panel.scrollArea.horizontalScrollBar().setValue(target_x - (view_w // 2))
         self.camera_panel.scrollArea.verticalScrollBar().setValue(target_y - (view_h // 2))
 
-    def _get_colormap_lut(self, cv_cmap, cmap_choice):
-        lut = self._colormap_luts.get(cv_cmap)
+    def _get_colormap_lut(self, cmap_choice):
+        """RGB lookup table (shape 1x256x3) for a color-map name from
+        COLORMAP_CHOICES; unknown names fall back to Inferno."""
+        if cmap_choice not in COLORMAP_CHOICES:
+            cmap_choice = "Inferno"
+        lut = self._colormap_luts.get(cmap_choice)
         if lut is not None:
             return lut
         ramp = np.arange(256, dtype=np.uint8).reshape(1, 256)
-        bgr_lut = cv2.applyColorMap(ramp, cv_cmap)
-        rgb_lut = np.ascontiguousarray(cv2.cvtColor(bgr_lut, cv2.COLOR_BGR2RGB))
-        if cmap_choice == "Jet":
-            rgb_lut[0, :15, :] = 0
-        self._colormap_luts[cv_cmap] = rgb_lut
+        if cmap_choice == "Grayscale":
+            rgb_lut = np.ascontiguousarray(np.repeat(ramp[:, :, None], 3, axis=2))
+        else:
+            bgr_lut = cv2.applyColorMap(ramp, CV_COLORMAPS[cmap_choice])
+            rgb_lut = np.ascontiguousarray(cv2.cvtColor(bgr_lut, cv2.COLOR_BGR2RGB))
+            if cmap_choice == "Jet":
+                rgb_lut[0, :15, :] = 0
+        self._colormap_luts[cmap_choice] = rgb_lut
         return rgb_lut
 
     def _fit_gaussian(self, numbers, values, info, center_guess):
@@ -4765,7 +5885,7 @@ class MainWindow(QMainWindow):
         if not self._camera_connected:
             QMessageBox.warning(self, "Dark Frame", "Connect a camera first.")
             return
-        self.advanced_panel.darkStatusLabel.setText("Dark frame: capturing 8 frames...")
+        self.control_panel.darkStatusLabel.setText("Dark frame: capturing 8 frames...")
         self._camera_bridge.dark_requested.emit(8)
 
 
@@ -4811,15 +5931,15 @@ class MainWindow(QMainWindow):
         dark_valid = False; dark_reason = ""; dark_applied = False
         if self._dark_frame is not None and self._dark_metadata is not None:
             dark_valid, dark_reason = dark_metadata_match(self._dark_metadata, current_dark_meta)
-        if self.advanced_panel.darkEnableCheckbox.isChecked() and dark_valid:
+        if self.control_panel.darkEnableCheckbox.isChecked() and dark_valid:
             corrected = subtract_dark_frame(gray_raw, self._dark_frame); dark_applied = True
-            self.advanced_panel.darkStatusLabel.setText("Dark frame: valid and applied")
+            self.control_panel.darkStatusLabel.setText("Dark frame: valid and applied")
         else:
             corrected = gray_raw.astype(np.float32)
-            if self.advanced_panel.darkEnableCheckbox.isChecked() and self._dark_frame is not None and not dark_valid:
-                self.advanced_panel.darkStatusLabel.setText("Dark frame disabled: " + dark_reason)
+            if self.control_panel.darkEnableCheckbox.isChecked() and self._dark_frame is not None and not dark_valid:
+                self.control_panel.darkStatusLabel.setText("Dark frame disabled: " + dark_reason)
             elif self._dark_frame is None:
-                self.advanced_panel.darkStatusLabel.setText("Dark frame: not captured")
+                self.control_panel.darkStatusLabel.setText("Dark frame: not captured")
         if self._frame_buffer.maxlen and self._frame_buffer.maxlen > 1:
             if self._frame_sum is None or self._frame_sum.shape != corrected.shape:
                 self._frame_sum = np.zeros_like(corrected); self._frame_buffer.clear()
@@ -4870,11 +5990,9 @@ class MainWindow(QMainWindow):
         gray_raw=processed.raw.data; measure_img=processed.analysis; calc_img=processed.roi
         offset_x,offset_y=processed.offset_x,processed.offset_y
 
-        advanced_enabled = self.advanced_panel.enableAdvancedMetricsCheckbox.isChecked()
-
         now = time.monotonic()
-        hot_mask_shape_ok = (not advanced_enabled) or (
-            self._cached_hot_mask is not None and self._cached_hot_mask.shape == calc_img.shape)
+        hot_mask_shape_ok = (self._cached_hot_mask is not None
+                             and self._cached_hot_mask.shape == calc_img.shape)
         refresh_advanced = (
             force_advanced
             or self._last_advanced_metrics_ts is None
@@ -4883,16 +6001,11 @@ class MainWindow(QMainWindow):
         )
 
         if refresh_advanced:
-            if advanced_enabled:
-                background_level, background_noise = robust_background_stats(calc_img)
-                hot_mask = detect_hot_pixels(calc_img, background_level, background_noise)
-                hot_count = int(np.count_nonzero(hot_mask))
-                hot_coords = np.nonzero(hot_mask) if hot_count else (
-                    np.empty(0, dtype=np.intp), np.empty(0, dtype=np.intp))
-            else:
-                background_level, background_noise = 0.0, 0.0
-                hot_mask, hot_count = None, 0
-                hot_coords = (np.empty(0, dtype=np.intp), np.empty(0, dtype=np.intp))
+            background_level, background_noise = robust_background_stats(calc_img)
+            hot_mask = detect_hot_pixels(calc_img, background_level, background_noise)
+            hot_count = int(np.count_nonzero(hot_mask))
+            hot_coords = np.nonzero(hot_mask) if hot_count else (
+                np.empty(0, dtype=np.intp), np.empty(0, dtype=np.intp))
             sensor_edge, roi_edge = edge_truncation_flags(measure_img, processed.roi_bounds)
             self._cached_background_level = background_level
             self._cached_background_noise = background_noise
@@ -4957,7 +6070,7 @@ class MainWindow(QMainWindow):
         warnings=MeasurementWarnings(low,central,isolated,sensor_edge,roi_edge)
         if warnings.invalidates_widths: hi=vi=None
 
-        if warnings.invalidates_widths or not advanced_enabled:
+        if warnings.invalidates_widths:
             moment = None
         elif refresh_advanced:
             moment = second_moment_2d(
@@ -5155,7 +6268,12 @@ class MainWindow(QMainWindow):
                          or (self.render_video and DRAW_LIVE_OVERLAY)
                          or self.sub_waist.isVisible()
                          or self._log_writer is not None)
-        if need_gaussian and (not is_new_acquisition or self.frame_counter % GAUSSIAN_FIT_INTERVAL == 0):
+        is_static = bool(self.current_backend_capabilities
+                         and self.current_backend_capabilities.get("is_static_source"))
+        # An uploaded image is analyzed once, so the fit must not wait for
+        # the every-Nth-frame schedule used for live video.
+        if need_gaussian and (not is_new_acquisition or is_static
+                              or self.frame_counter % GAUSSIAN_FIT_INTERVAL == 0):
             self._last_gaussian_popt_x, self._last_gaussian_r2_x = self._fit_gaussian(
                 numbers_x, x_values, h_info, center_x)
             self._last_gaussian_popt_y, self._last_gaussian_r2_y = self._fit_gaussian(
@@ -5165,8 +6283,7 @@ class MainWindow(QMainWindow):
         good_fit_x = self._last_gaussian_popt_x is not None and (self._last_gaussian_r2_x or 0) >= r2_threshold
         good_fit_y = self._last_gaussian_popt_y is not None and (self._last_gaussian_r2_y or 0) >= r2_threshold
 
-        wavelength_nm = self.advanced_panel.wavelengthSpinBox.value()
-        treat_as_waist = self.analyze_panel.treatAsWaistCheckbox.isChecked()
+        wavelength_nm = self.advanced_panel.wavelengthSpinBox.value()   # recorded with propagation samples
         diam_x_um = None
         diam_y_um = None
 
@@ -5176,13 +6293,6 @@ class MainWindow(QMainWindow):
             self._set_cell(self.analyze_panel.gauss_diam_x_label,
                 f"{diam_x_um:.1f} µm  (R² {self._last_gaussian_r2_x:.3f})",
                 f"{diam_x_px:.1f} px\nFit shape: Gaussian (R² ≥ {r2_threshold:.3f})")
-            if treat_as_waist:
-                div_x_mrad = divergence_half_angle_mrad(diam_x_um / 2.0, wavelength_nm)
-                self._set_text_if_changed(self.analyze_panel.divergence_x_label, 
-                    f"X Min. Divergence (IF waist, M²=1): {div_x_mrad:.3f} mrad" if div_x_mrad is not None
-                    else "X Divergence: N/A")
-            else:
-                self._set_text_if_changed(self.analyze_panel.divergence_x_label, "X Divergence: enable checkbox")
         else:
             if self._last_gaussian_r2_x is None:
                 self._set_cell(self.analyze_panel.gauss_diam_x_label, "N/A")
@@ -5191,7 +6301,6 @@ class MainWindow(QMainWindow):
                     f"Not Gaussian  (R² {self._last_gaussian_r2_x:.3f})",
                     f"R² is below the fit threshold ({r2_threshold:.3f}), so the Gaussian "
                     "diameter is not reported. Use D4σ for non-Gaussian beams.")
-            self._set_text_if_changed(self.analyze_panel.divergence_x_label, "X Divergence: enable checkbox")
 
         if good_fit_y:
             diam_y_px = gaussian_1e2_diameter(self._last_gaussian_popt_y)
@@ -5199,13 +6308,6 @@ class MainWindow(QMainWindow):
             self._set_cell(self.analyze_panel.gauss_diam_y_label,
                 f"{diam_y_um:.1f} µm  (R² {self._last_gaussian_r2_y:.3f})",
                 f"{diam_y_px:.1f} px\nFit shape: Gaussian (R² ≥ {r2_threshold:.3f})")
-            if treat_as_waist:
-                div_y_mrad = divergence_half_angle_mrad(diam_y_um / 2.0, wavelength_nm)
-                self._set_text_if_changed(self.analyze_panel.divergence_y_label, 
-                    f"Y Min. Divergence (IF waist, M²=1): {div_y_mrad:.3f} mrad" if div_y_mrad is not None
-                    else "Y Divergence: N/A")
-            else:
-                self._set_text_if_changed(self.analyze_panel.divergence_y_label, "Y Divergence: enable checkbox")
         else:
             if self._last_gaussian_r2_y is None:
                 self._set_cell(self.analyze_panel.gauss_diam_y_label, "N/A")
@@ -5214,7 +6316,6 @@ class MainWindow(QMainWindow):
                     f"Not Gaussian  (R² {self._last_gaussian_r2_y:.3f})",
                     f"R² is below the fit threshold ({r2_threshold:.3f}), so the Gaussian "
                     "diameter is not reported. Use D4σ for non-Gaussian beams.")
-            self._set_text_if_changed(self.analyze_panel.divergence_y_label, "Y Divergence: enable checkbox")
 
         self._set_text_if_changed(self.analyze_panel.peak_position_label, 
             f"Peak: ({peak_x * pitch:.1f}, {peak_y * pitch:.1f}) µm")
@@ -5224,14 +6325,15 @@ class MainWindow(QMainWindow):
         if self.sensor_saturation_known:
             self._set_text_if_changed(self.analyze_panel.saturation_label,
                 f"A/D Saturation: {saturation_pct:.1f}%")
-            self.analyze_panel.saturation_label.setStyleSheet("color: red;" if saturation_pct >= 95 else "")
+            self.analyze_panel.saturation_label.setStyleSheet(
+                f"color: {theme_color('error_strong')};" if saturation_pct >= 95 else "")
             # Camera panel readout, color-coded for a quick glance while adjusting exposure.
             if saturation_pct >= 95:
-                sat_color = "#e04040"      # red: saturating
+                sat_color = theme_color("error")   # saturating
             elif saturation_pct > 90 or saturation_pct < 20:
-                sat_color = "#e0a030"      # yellow: near saturation, or weak signal
+                sat_color = theme_color("warn")    # near saturation, or weak signal
             else:
-                sat_color = "#3cb371"      # green: good exposure
+                sat_color = theme_color("ok")      # good exposure
             self._set_text_if_changed(self.camera_panel.saturationLabel, f"Saturation: {saturation_pct:.1f}%")
             sat_style = f"color: {sat_color}; font-weight: bold;"
         else:
@@ -5246,14 +6348,10 @@ class MainWindow(QMainWindow):
         displayed_peak = measurement.quality.displayed_peak
         averaged_peak = measurement.quality.averaged_peak
         raw_peak = measurement.quality.raw_peak
-        if self.advanced_panel.enableAdvancedMetricsCheckbox.isChecked():
-            self._set_cell(self.analyze_panel.background_label,
-                f"Background: {background_level:.2f} counts (noise σ {background_noise:.2f})",
-                f"Median background {background_level:.2f}, MAD noise σ {background_noise:.2f}\n"
-                f"Background-subtracted total counts: {measurement.background_subtracted_counts:.1f}")
-        else:
-            self._set_cell(self.analyze_panel.background_label,
-                "Background: disabled (Advanced Settings > Enable D4σ/background/hot-pixel analysis)")
+        self._set_cell(self.analyze_panel.background_label,
+            f"Background: {background_level:.2f} counts (noise σ {background_noise:.2f})",
+            f"Median background {background_level:.2f}, MAD noise σ {background_noise:.2f}\n"
+            f"Background-subtracted total counts: {measurement.background_subtracted_counts:.1f}")
         flags = []
         if low_snr: flags.append("LOW SNR")
         if central_saturation: flags.append("CENTRAL SATURATION")
@@ -5265,21 +6363,18 @@ class MainWindow(QMainWindow):
         peaks_tip = (f"Peaks (raw / corrected / averaged / display): {raw_peak:.1f} / "
                      f"{corrected_peak:.1f} / {averaged_peak:.1f} / {displayed_peak:.1f}")
         status_text = ", ".join(flags) if flags else "OK"
-        if self.advanced_panel.enableAdvancedMetricsCheckbox.isChecked():
-            if np.isinf(snr_peak):
-                # Zero measured background noise gives an infinite ratio. That is
-                # correct, but "inf" looks like a bug, so explain where it comes from.
-                if self.current_camera_backend_name == DemoCameraBackend.name:
-                    snr_text = "\u221e (noise-free simulation)"
-                else:
-                    snr_text = "\u221e (no measurable background noise)"
+        if np.isinf(snr_peak):
+            # Zero measured background noise gives an infinite ratio. That is
+            # correct, but "inf" looks like a bug, so explain where it comes from.
+            if self.current_camera_backend_name == DemoCameraBackend.name:
+                snr_text = "\u221e (noise-free simulation)"
             else:
-                snr_text = f"{snr_peak:.1f}"
+                snr_text = "\u221e (no measurable background noise)"
         else:
-            snr_text = "N/A (background analysis disabled)"
+            snr_text = f"{snr_peak:.1f}"
         self._set_cell(self.analyze_panel.quality_label,
                        f"SNR: {snr_text}   \u2022   Status: {status_text}", peaks_tip)
-        quality_style = "color: #e0a030;" if flags else ""
+        quality_style = f"color: {theme_color('warn')};" if flags else ""
         if self.analyze_panel.quality_label.styleSheet() != quality_style:
             self.analyze_panel.quality_label.setStyleSheet(quality_style)
         self._latest_quality = measurement.quality
@@ -5329,7 +6424,11 @@ class MainWindow(QMainWindow):
         else:
             self._set_text_if_changed(self.analyze_panel.power_label, "Total Power: Not Calibrated")
 
-        if is_new_acquisition and self._log_writer is not None and self.frame_counter % LOG_EVERY_N_FRAMES == 0:
+        # Live video: one row every LOG_EVERY_N_FRAMES frames. Uploaded image:
+        # exactly one row each time it is loaded (its single "acquisition").
+        # Re-analysis (Reprocess, scrolling, theme changes...) never logs.
+        if (is_new_acquisition and self._log_writer is not None
+                and (is_static or self.frame_counter % LOG_EVERY_N_FRAMES == 0)):
             fwhm_x_px = h_info.get("fwhm_width") if h_info else None
             fwhm_y_px = v_info.get("fwhm_width") if v_info else None
             e2_x_px = h_info.get("e2_width") if h_info else None
@@ -5356,9 +6455,13 @@ class MainWindow(QMainWindow):
                 orientation_deg if orientation_deg is not None else "",
                 moment_ellipticity if moment_ellipticity is not None else "",
                 moment_truncated,
+                (self._upload_source_filename or "") if is_static else "",
+                diam_x_um if diam_x_um is not None else "",
+                diam_y_um if diam_y_um is not None else "",
+                status_text,
             ])
             self._log_row_count += 1
-            if self._log_row_count % 10 == 0:
+            if is_static or self._log_row_count % 10 == 0:
                 self._log_file.flush()
 
         if is_new_acquisition and self.render_stability and self.frame_counter % LOG_EVERY_N_FRAMES == 0:
@@ -5373,15 +6476,7 @@ class MainWindow(QMainWindow):
             zoom_pct = self.control_panel.zoomSlider.value()
             zoom_factor = zoom_pct / 100.0
 
-            cmap_choice = self.control_panel.cmapCombo.currentText()
-            cv_cmap = {
-                "Inferno": cv2.COLORMAP_INFERNO,
-                "Jet": cv2.COLORMAP_JET,
-                "Hot": cv2.COLORMAP_HOT,
-                "Magma": cv2.COLORMAP_MAGMA,
-            }.get(cmap_choice, cv2.COLORMAP_INFERNO)
-
-            color_lut = self._get_colormap_lut(cv_cmap, cmap_choice)
+            color_lut = self._get_colormap_lut(self.control_panel.cmapCombo.currentText())
             rgb_image = cv2.LUT(cv2.merge([display_img, display_img, display_img]), color_lut)
 
             if has_beam:
@@ -5526,8 +6621,6 @@ class MainWindow(QMainWindow):
             self._set_cell(y_label, "N/A")
         self._set_text_if_changed(self.analyze_panel.d4sigma_principal_label, "Principal D4σ (major/minor, angle): N/A")
         self._set_text_if_changed(self.analyze_panel.d4sigma_ellipticity_label, "Ellipticity (minor/major D4σ): N/A")
-        self._set_text_if_changed(self.analyze_panel.divergence_x_label, "X Divergence: enable checkbox")
-        self._set_text_if_changed(self.analyze_panel.divergence_y_label, "Y Divergence: enable checkbox")
 
         self._set_text_if_changed(self.analyze_panel.peak_position_label, "Peak: N/A")
         self._set_text_if_changed(self.analyze_panel.centroid_position_label, "Centroid: N/A")
@@ -5576,12 +6669,7 @@ class MainWindow(QMainWindow):
         this is a measurement-validity problem, not an image-validity
         problem -- and only clear/N-A the measurement-dependent outputs."""
         display_img = processed.display_u8
-        cmap_choice = self.control_panel.cmapCombo.currentText()
-        cv_cmap = {
-            "Viridis": cv2.COLORMAP_VIRIDIS, "Jet": cv2.COLORMAP_JET,
-            "Hot": cv2.COLORMAP_HOT, "Magma": cv2.COLORMAP_MAGMA,
-        }.get(cmap_choice, cv2.COLORMAP_INFERNO)
-        color_lut = self._get_colormap_lut(cv_cmap, cmap_choice)
+        color_lut = self._get_colormap_lut(self.control_panel.cmapCombo.currentText())
         rgb_image = cv2.LUT(cv2.merge([display_img, display_img, display_img]), color_lut)
 
         h, w, ch = rgb_image.shape
@@ -5598,6 +6686,31 @@ class MainWindow(QMainWindow):
 
         self._clear_measurement_outputs()
         self.status_camera_label.setText(reason_text)
+
+    @staticmethod
+    def _draw_outlined_polyline(image, pts, color, thickness):
+        """Dark outline first, then the colored line on top, so the curve
+        stays visible on any color map."""
+        pts = pts.reshape(-1, 1, 2)
+        cv2.polylines(image, [pts], False, OVERLAY_OUTLINE_RGB, thickness + max(2, thickness), cv2.LINE_AA)
+        cv2.polylines(image, [pts], False, color, thickness, cv2.LINE_AA)
+
+    @staticmethod
+    def _put_outlined_label(image, text, peak_xy, direction, gap, color, font_scale, thickness):
+        """Label placed just beyond a curve's peak in `direction` ((1, -1) =
+        upper right, (1, 1) = lower right, ...), offset by the gap PLUS half the text's
+        own size so it never sits on the curve. Clamped to stay fully inside
+        the image, with a dark outline for contrast."""
+        h, w = image.shape[:2]
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        (tw, th), baseline = cv2.getTextSize(text, font, font_scale, thickness)
+        center_xy = (peak_xy[0] + direction[0] * (gap + tw / 2),
+                     peak_xy[1] + direction[1] * (gap + th / 2))
+        x = int(min(max(center_xy[0] - tw / 2, 2), max(2, w - tw - 2)))
+        y = int(min(max(center_xy[1] + th / 2, th + 2), max(th + 2, h - baseline - 2)))
+        cv2.putText(image, text, (x, y), font, font_scale, OVERLAY_OUTLINE_RGB,
+                    thickness + max(2, thickness), cv2.LINE_AA)
+        cv2.putText(image, text, (x, y), font, font_scale, color, thickness, cv2.LINE_AA)
 
     def _draw_live_overlay(self, image, scale, centers, numbers_x, numbers_y, popt_x, popt_y, pixel_size,
                            zoom_factor, show_centroid=True, show_peak=True,
@@ -5629,9 +6742,30 @@ class MainWindow(QMainWindow):
         if show_gaussian_fit:
             beamxfordirection = popt_x[1] if popt_x is not None else cx
             beamyfordirection = popt_y[1] if popt_y is not None else cy
+            # Labels are a bit larger/bolder than the grid numbers and offset
+            # diagonally from each peak, so they don't sit on the white grid
+            # axes (which pass through the peaks when the beam is centered).
+            label_gap = max(3, int(round(6 * ui_scale)))
+            hide_tails = self.control_panel.hideTailsCheckbox.isChecked()
+            label_font_scale = font_scale * 1.3
+            label_thick = font_thick + 1
 
-            x_amp_sign = -1 if beamyfordirection < sensor_cy else 1
-            y_amp_sign = 1 if beamxfordirection > sensor_cx else -1
+            if self.control_panel.overlayAnchorCombo.currentText() == OVERLAY_ANCHOR_EDGES:
+                # Curves sit on the bottom and left edges of the VISIBLE area
+                # (not the full image, which is often scrolled out of view)
+                # and point into the image, so they never cross each other.
+                vx0, vy0, vx1, vy1 = self._visible_image_rect(w, h, zoom_factor)
+                margin = max(2, int(round(OVERLAY_EDGE_MARGIN_BASE_PX * inv_zoom)))
+                x_base, x_dir = vy1 - margin, -1
+                y_base, y_dir = vx0 + margin, 1
+                x_height = min(self.overlay_curve_height, OVERLAY_EDGE_MAX_HEIGHT_FRAC * (vy1 - vy0))
+                y_height = min(self.overlay_curve_height, OVERLAY_EDGE_MAX_HEIGHT_FRAC * (vx1 - vx0))
+            else:
+                # Original behavior: on the axes through the image center,
+                # pointing toward the beam.
+                x_base, x_dir = sensor_cy, (-1 if beamyfordirection < sensor_cy else 1)
+                y_base, y_dir = sensor_cx, (1 if beamxfordirection > sensor_cx else -1)
+                x_height = y_height = self.overlay_curve_height
 
             if popt_x is not None:
                 fitted_x = gaussian_model(numbers_x, *popt_x)
@@ -5642,19 +6776,15 @@ class MainWindow(QMainWindow):
                     fitted_x_norm = fitted_x / max_x
 
                     xs = (numbers_x * scale).astype(np.int32)
-                    ys = (sensor_cy + x_amp_sign * fitted_x_norm * self.overlay_curve_height).astype(np.int32)
+                    ys = (x_base + x_dir * fitted_x_norm * x_height).astype(np.int32)
                     mask_x = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
+                    if hide_tails:
+                        mask_x &= fitted_x_norm >= OVERLAY_TAIL_CUTOFF
                     pts_x = np.stack([xs[mask_x], ys[mask_x]], axis=1)
 
                     if len(pts_x) > 1:
-                        cv2.polylines(
-                            overlay,
-                            [pts_x.reshape(-1, 1, 2)],
-                            False,
-                            (255, 255, 0),
-                            curve_line_px,
-                            cv2.LINE_AA
-                        )
+                        self._draw_outlined_polyline(overlay, pts_x, OVERLAY_X_CURVE_RGB, curve_line_px)
+
 
             if popt_y is not None:
                 fitted_y = gaussian_model(numbers_y, *popt_y)
@@ -5665,20 +6795,16 @@ class MainWindow(QMainWindow):
                     fitted_y_norm = fitted_y / max_y
 
                     ys_curve = (numbers_y * scale).astype(np.int32)
-                    xs_curve = (sensor_cx + y_amp_sign * fitted_y_norm * self.overlay_curve_height).astype(np.int32)
+                    xs_curve = (y_base + y_dir * fitted_y_norm * y_height).astype(np.int32)
 
                     mask_y = (xs_curve >= 0) & (xs_curve < w) & (ys_curve >= 0) & (ys_curve < h)
+                    if hide_tails:
+                        mask_y &= fitted_y_norm >= OVERLAY_TAIL_CUTOFF
                     pts_y = np.stack([xs_curve[mask_y], ys_curve[mask_y]], axis=1)
 
                     if len(pts_y) > 1:
-                        cv2.polylines(
-                            overlay,
-                            [pts_y.reshape(-1, 1, 2)],
-                            False,
-                            (255, 255, 0),
-                            curve_line_px,
-                            cv2.LINE_AA
-                        )
+                        self._draw_outlined_polyline(overlay, pts_y, OVERLAY_Y_CURVE_RGB, curve_line_px)
+
 
         if show_grid:
             if pixel_size is None or pixel_size <= 0:
@@ -5767,7 +6893,7 @@ class MainWindow(QMainWindow):
             "timestamp": datetime.now().isoformat(timespec="seconds"),
             "camera_backend": self.current_camera_backend_name,
             "dark_correction": {
-                "enabled": self.advanced_panel.darkEnableCheckbox.isChecked(),
+                "enabled": self.control_panel.darkEnableCheckbox.isChecked(),
                 "applied": bool(fresh_quality.dark_applied) if fresh_quality else False,
                 "valid": bool(fresh_quality.dark_valid) if fresh_quality else False,
                 "mismatch_reason": fresh_quality.dark_mismatch_reason if fresh_quality else "",
@@ -5782,6 +6908,8 @@ class MainWindow(QMainWindow):
             "colormap": self.control_panel.cmapCombo.currentText(),
             "zoom_percent": self.control_panel.zoomSlider.value(),
             "overlay_curve_height_px": self.overlay_curve_height,
+            "overlay_anchor": self.control_panel.overlayAnchorCombo.currentText(),
+            "overlay_hide_tails": self.control_panel.hideTailsCheckbox.isChecked(),
             "sensor_bit_depth": self.sensor_bit_depth,
             "sensor_max_raw": self.sensor_max_raw,
             "centroid_px": {"x": self.last_cx, "y": self.last_cy},
@@ -5824,11 +6952,112 @@ class MainWindow(QMainWindow):
             self._camera_bridge.exposure_requested.emit(float(exposure_ms))
         self.timer.start(timer_ms)
 
-        self.control_panel.sliderLabel.setText(f"Exposure: {exposure_ms:.2f}ms | Target Display Rate: {target_fps:.1f} FPS")
 
     def update_demo_beam_diameter(self, diameter_um):
         if self._camera_connected:
             self._camera_bridge.demo_diameter_requested.emit(float(diameter_um))
+
+    def update_demo_beam_center(self, _value=None):
+        # Reads BOTH boxes so X and Y always travel together. When no camera
+        # is connected the values are simply kept and sent in the connect spec.
+        if self._camera_connected:
+            self._camera_bridge.demo_center_requested.emit(
+                float(self.control_panel.demoCenterXSpinBox.value()),
+                float(self.control_panel.demoCenterYSpinBox.value()))
+
+    # ---- Drag-to-move for the simulated beam --------------------------------
+    def _demo_drag_available(self):
+        label = self.camera_panel.videoLabel
+        pixmap = label.pixmap()
+        # Requires the demo camera to be connected AND still selected in the
+        # dropdown (its position controls are hidden otherwise).
+        return (self._camera_connected
+                and self.current_camera_backend_name == DemoCameraBackend.name
+                and self.control_panel.cameraBackendCombo.currentText() == DemoCameraBackend.name
+                and pixmap is not None and not pixmap.isNull()
+                and label.width() > 0 and label.height() > 0)
+
+    def _update_demo_drag_cursor(self):
+        label = self.camera_panel.videoLabel
+        if self._demo_drag_available():
+            label.setCursor(Qt.CursorShape.ClosedHandCursor if self._demo_dragging
+                            else Qt.CursorShape.OpenHandCursor)
+        else:
+            self._demo_dragging = False
+            label.unsetCursor()
+
+    def _move_demo_beam_to_label_pos(self, pos):
+        """Convert a mouse position on the video label to a beam center in um.
+
+        The label is resized to exactly the zoomed image (setFixedSize), so
+        there is no letterbox margin: sensor_px = label_px * W / label_width.
+        Scaling by the actual label size (not the zoom percent) avoids the
+        rounding from int(w * zoom)."""
+        label = self.camera_panel.videoLabel
+        W, H = DemoCameraBackend.WIDTH_PX, DemoCameraBackend.HEIGHT_PX
+        pitch = DemoCameraBackend.PIXEL_PITCH_UM
+        # Pixel CENTERS sit at index + 0.5 in widget space, hence the - 0.5.
+        sx = pos.x() * W / label.width() - 0.5
+        sy = pos.y() * H / label.height() - 0.5
+        x_um = (sx - (W - 1) / 2.0) * pitch
+        y_um = (sy - (H - 1) / 2.0) * pitch
+        lim_x, lim_y = DemoCameraBackend.center_limits_um()
+        x_um = min(max(x_um, -lim_x), lim_x)
+        y_um = min(max(y_um, -lim_y), lim_y)
+        self.control_panel.set_demo_center_um(round(x_um, 1), round(y_um, 1))
+
+    def eventFilter(self, obj, event):
+        if obj is getattr(self, "_camera_viewport", None):
+            if event.type() == QEvent.Type.Resize:
+                self._schedule_edge_overlay_redraw()
+            return super().eventFilter(obj, event)
+        if obj is self.camera_panel.videoLabel:
+            etype = event.type()
+            if etype == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+                if self._demo_drag_available():
+                    self._demo_dragging = True
+                    self._update_demo_drag_cursor()
+                    self._move_demo_beam_to_label_pos(event.position())
+                    return True
+            elif etype == QEvent.Type.MouseMove and self._demo_dragging:
+                if (event.buttons() & Qt.MouseButton.LeftButton) and self._demo_drag_available():
+                    self._move_demo_beam_to_label_pos(event.position())
+                    return True
+                self._demo_dragging = False
+                self._update_demo_drag_cursor()
+            elif etype == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
+                if self._demo_dragging:
+                    self._demo_dragging = False
+                    self._update_demo_drag_cursor()
+                    return True
+            elif etype == QEvent.Type.Enter:
+                self._update_demo_drag_cursor()
+        return super().eventFilter(obj, event)
+
+    def _refit_controls_later(self):
+        if self.isVisible() and self.sub_controls.isVisible():
+            QTimer.singleShot(0, self._refit_controls_now)
+
+    def _refit_controls_now(self):
+        self.sub_controls.fit_to_contents()
+        self._separate_controls_and_calculations()
+
+    def _update_backend_dependent_visibility(self, backend_name):
+        """Show/hide controls that only apply to some backends. Kept separate
+        from on_camera_backend_changed (which also rescans) so it can run at
+        startup and after a factory reset, where the combo's change signal
+        may not fire."""
+        is_upload = backend_name == "Uploaded Image"
+        is_demo = backend_name == "Demo / Simulated Camera"
+        self.control_panel.scanCamerasButton.setVisible(not is_upload)
+        self.control_panel.deviceLabel.setVisible(not is_upload)
+        self.control_panel.deviceCombo.setVisible(not is_upload)
+        self.control_panel.connectCameraButton.setVisible(not is_upload)
+        for widget in self.control_panel.demoWidgets:
+            widget.setVisible(is_demo)
+        self._update_demo_drag_cursor()
+        # Rows appeared or disappeared: grow Controls if it now needs to scroll.
+        self._refit_controls_later()
 
     def _on_upload_setting_changed(self, _value=None):
         self.upload_panel._update_load_enabled()
@@ -5844,16 +7073,43 @@ class MainWindow(QMainWindow):
         if caps and caps.get("is_static_source") and self._latest_raw_packet is not None:
             self.reprocess_current_frame()
 
+    def _schedule_static_redraw(self, *_args):
+        """Debounced redraw for an uploaded (static) image. Live cameras
+        redraw every frame anyway, so this does nothing for them."""
+        timer = getattr(self, "_static_redraw_timer", None)
+        caps = getattr(self, "current_backend_capabilities", None)
+        if (timer is not None and caps and caps.get("is_static_source")
+                and getattr(self, "_latest_raw_packet", None) is not None):
+            timer.start()
+
+    def _schedule_edge_overlay_redraw(self, *_args):
+        """Scrolling or resizing only moves the overlay in 'Image edges'
+        mode, so only then does a static image need redrawing."""
+        if self.control_panel.overlayAnchorCombo.currentText() == OVERLAY_ANCHOR_EDGES:
+            self._schedule_static_redraw()
+
+    def _visible_image_rect(self, w, h, zoom_factor):
+        """Part of the (unzoomed) display image currently visible in the
+        camera scroll area, as inclusive pixel bounds (x0, y0, x1, y1).
+        Scrollbar values and viewport size are in the same logical units
+        as the zoomed label, so dividing by zoom gives image pixels. If the
+        image is smaller than the viewport, this is the whole image."""
+        z = zoom_factor if zoom_factor > 0 else 1.0
+        sa = self.camera_panel.scrollArea
+        vp = sa.viewport()
+        vx0 = sa.horizontalScrollBar().value() / z
+        vy0 = sa.verticalScrollBar().value() / z
+        vx1 = vx0 + vp.width() / z
+        vy1 = vy0 + vp.height() / z
+        x0 = int(min(max(vx0, 0), w - 1))
+        y0 = int(min(max(vy0, 0), h - 1))
+        x1 = int(min(max(vx1 - 1, x0), w - 1))
+        y1 = int(min(max(vy1 - 1, y0), h - 1))
+        return x0, y0, x1, y1
+
     def on_camera_backend_changed(self, backend_name):
         is_upload = backend_name == "Uploaded Image"
-        is_demo = backend_name == "Demo / Simulated Camera"
-
-        self.control_panel.scanCamerasButton.setVisible(not is_upload)
-        self.control_panel.deviceLabel.setVisible(not is_upload)
-        self.control_panel.deviceCombo.setVisible(not is_upload)
-        self.control_panel.connectCameraButton.setVisible(not is_upload)
-        self.control_panel.demoDiameterLabel.setVisible(is_demo)
-        self.control_panel.demoDiameterSpinBox.setVisible(is_demo)
+        self._update_backend_dependent_visibility(backend_name)
 
         if is_upload:
             # Never open a file dialog just because the dropdown changed
@@ -5955,6 +7211,9 @@ class MainWindow(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    # Must be set before any window is created (and before the dark/light
+    # stylesheet, which then builds on top of this style).
+    app.setStyle(WideResizeBorderStyle())
     icon_path = resource_path("app_icon.ico")
     if os.path.exists(icon_path):
         app.setWindowIcon(QIcon(icon_path))

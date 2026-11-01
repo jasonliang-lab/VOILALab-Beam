@@ -1,0 +1,10 @@
+file,purpose,true_major_1e2_diameter_um,true_minor_1e2_diameter_um,true_angle_deg,expected_D4sigma_x_um,expected_D4sigma_y_um,expected_FWHM_x_um,expected_FWHM_y_um,true_center_x_px,true_center_y_px,background_offset_counts,read_noise_sigma_counts,shot_noise
+01_round_100um.npy,Small beam (about 29 px across),100.0,100.0,0.0,100.0,100.0,58.9,58.9,720.37,539.79,0,0,no
+02_round_500um.npy,Standard beam,500.0,500.0,0.0,500.0,500.0,294.4,294.4,720.37,539.79,0,0,no
+03_round_1000um.npy,Large beam,1000.0,1000.0,0.0,1000.0,1000.0,588.7,588.7,720.37,539.79,0,0,no
+04_ellipse_500x300um.npy,"Elliptical beam, axes along x and y",500.0,300.0,0.0,500.0,300.0,294.4,176.6,720.37,539.79,0,0,no
+05_ellipse_500x300um_rot30.npy,Elliptical beam rotated 30 deg (check principal D4sigma and angle),500.0,300.0,30.0,458.3,360.6,n/a (rotated),n/a (rotated),720.37,539.79,0,0,no
+06_round_500um_noise.npy,Shot noise + read noise (sigma 10 counts) on a 50-count black level,500.0,500.0,0.0,500.0,500.0,294.4,294.4,720.37,539.79,50,10,yes
+07_round_500um_background.npy,"Uniform 300-count background offset, no noise",500.0,500.0,0.0,500.0,500.0,294.4,294.4,720.37,539.79,300,0,no
+08_round_500um_noise_background.npy,"Realistic: 150-count background, shot noise and read noise",500.0,500.0,0.0,500.0,500.0,294.4,294.4,720.37,539.79,150,10,yes
+09_edge_truncated_500um.npy,"Beam center only 150 um from the left edge: truncation warning expected, widths NOT expected to be accurate",500.0,500.0,0.0,500.0,500.0,294.4,294.4,43.48,539.79,0,0,no
