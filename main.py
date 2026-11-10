@@ -5207,11 +5207,17 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(50, self._arrange_launch_layout)
             return
         gap = 10
+        cam, k = self.sub_camera, self.sub_waist
+        if cam.isVisible() and k.isVisible():
+            k.move(cam.x() + cam.width() + gap, k.y())        
         for sub in (self.sub_controls, self.sub_waist):
             if sub.isVisible():
                 sub._auto_fitted = True
                 sub.fit_to_contents(exact=True)
-        self._separate_controls_and_calculations()
+        c, k = self.sub_controls, self.sub_waist
+        if c.isVisible() and k.isVisible():
+            view_w = self.mdiArea.viewport().width()
+            c.move(min(k.x() + k.width() + gap, max(0, view_w - c.width())), c.y())
 
     def _separate_controls_and_calculations(self):
         """If Controls and Calculations overlap, move whichever panel is on
