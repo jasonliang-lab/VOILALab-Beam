@@ -5252,6 +5252,9 @@ class MainWindow(QMainWindow):
         sub.setWidget(widget)
         self.mdiArea.addSubWindow(sub)
         sub.setWindowTitle(title)
+        blank = QPixmap(16, 16)
+        blank.fill(Qt.GlobalColor.transparent)
+        sub.setWindowIcon(QIcon(blank))
         sub.setGeometry(x, y, w, h)
         sub.setVisible(visible)
         return sub
