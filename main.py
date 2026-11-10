@@ -231,7 +231,7 @@ QToolButton {
 }
 QToolButton:hover { background-color: $field_hover; }
 QToolButton:checked { background-color: $accent; border: 1px solid $accent_border; color: #ffffff; }
-QToolBar QToolButton { font-size: 13pt; }
+QToolBar QToolButton { font-size: 13px; }
 
 QTableView::indicator, QCheckBox::indicator {
     width: 14px; height: 14px; border: 1px solid $indicator_border;
@@ -303,7 +303,7 @@ QToolButton:checked {
 }
 QMdiSubWindow { background-color: #333333; color: #e0e0e0; }
 QScrollArea { background-color: #1e1e1e; }
-QToolBar QToolButton { font-size: 13pt; }
+QToolBar QToolButton { font-size: 13px; }
 
 QTableView::indicator {
     width: 14px; height: 14px; border: 1px solid #8a8a8a;
@@ -3125,7 +3125,7 @@ def section_header(title, point_size=12):
     header = QLabel(title)
     font = header.font()
     font.setBold(True)
-    font.setPointSize(point_size)
+    font.setPixelSize(point_size)
     header.setFont(font)
     set_role(header, "section")
     return header
@@ -3183,7 +3183,7 @@ class ControlPanel(QWidget):
     def __init__(self):
         super().__init__()
         font = self.font()
-        font.setPointSize(12)
+        font.setPixelSize(12)
         self.setFont(font)        
         layout = make_scroll_layout(self)
 
@@ -3442,7 +3442,7 @@ class AnalyzePanel(QWidget):
         def bold(label, size=11):
             font = label.font()
             font.setBold(True)
-            font.setPointSize(size)
+            font.setPixelSize(size)
             label.setFont(font)
             return label
 
@@ -4771,8 +4771,8 @@ class MainWindow(QMainWindow):
         self.sub_camera = self.add_panel(self.camera_panel, "Camera Panel", 20, 20, 500, 450)
         self.sub_graph_x = self.add_panel(self.graph_panel_x, "Beam Profile (X)", 20, 480, 340, 210)
         self.sub_graph_y = self.add_panel(self.graph_panel_y, "Beam Profile (Y)", 370, 480, 340, 210)
-        self.sub_controls = self.add_panel(self.control_panel, "Controls", 530, 20, 390, 500)
-        self.sub_waist = self.add_panel(self.analyze_panel, "Calculations", 930, 20, 400, 600)
+        self.sub_controls = self.add_panel(self.control_panel, "Controls", 950, 20, 390, 500)
+        self.sub_waist = self.add_panel(self.analyze_panel, "Calculations", 530, 20, 400, 600)
         self.sub_advanced = self.add_panel(self.advanced_panel, "Advanced Settings", 950, 20, 378, 690, visible=False)
         self.sub_stability = self.add_panel(self.stability_panel, "Beam Stability", 970, 60, 320, 260, visible=False)
         self.sub_propagation = self.add_panel(self.propagation_panel, "Propagation / M² Analysis", 60, 60, 1165, 650, visible=False)
@@ -5214,13 +5214,15 @@ class MainWindow(QMainWindow):
         self._separate_controls_and_calculations()
 
     def _separate_controls_and_calculations(self):
-        """If Controls and Calculations overlap, move Calculations to the
-        right of Controls (staying inside the workspace)."""
+        """If Controls and Calculations overlap, move whichever panel is on
+        the right so it sits just to the right of the other one (staying
+        inside the workspace)."""
         gap = 10
         c, k = self.sub_controls, self.sub_waist
         if c.isVisible() and k.isVisible() and k.geometry().intersects(c.geometry()):
+            left, right = (c, k) if c.x() <= k.x() else (k, c)
             view_w = self.mdiArea.viewport().width()
-            k.move(min(c.x() + c.width() + gap, max(0, view_w - k.width())), k.y())
+            right.move(min(left.x() + left.width() + gap, max(0, view_w - right.width())), right.y())
 
     _fit_exact_request = False
 
